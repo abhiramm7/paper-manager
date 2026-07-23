@@ -55,6 +55,7 @@ struct Sidebar: View {
             set: { if let v = $0 { filter = v } }
         )) {
             librarySection
+            importSection
             kindSection
             foldersSection
             authorsSection
@@ -66,7 +67,7 @@ struct Sidebar: View {
 
     @ViewBuilder
     private var librarySection: some View {
-        Section("Library") {
+        Section {
             Label("All", systemImage: "tray.full")
                 .badge(store.papers.count)
                 .tag(LibraryFilter.all)
@@ -79,6 +80,53 @@ struct Sidebar: View {
             Label("Rated 4+", systemImage: "star.fill")
                 .badge(highlyRatedCount)
                 .tag(LibraryFilter.highlyRated)
+        } header: {
+            sectionHeaderWithAction(
+                title: "Library",
+                icon: "doc.on.doc",
+                enabled: store.duplicateExtraCount > 0,
+                helpEnabled: "Review \(store.duplicateExtraCount) possible duplicate paper(s)",
+                helpDisabled: "No duplicate papers detected",
+                action: { NotificationCenter.default.post(name: .showDuplicates, object: nil) })
+        }
+    }
+
+    /// Watched-folder import. Operations live here (sidebar owns operations);
+    /// which folders are watched is configured in Settings. Hidden entirely
+    /// until the user configures at least one folder — no dead UI.
+    @ViewBuilder
+    private var importSection: some View {
+        if !store.watchedFolders.isEmpty {
+            Section {
+                Button {
+                    NotificationCenter.default.post(name: .showImportReview, object: nil)
+                } label: {
+                    HStack {
+                        Label("Review found PDFs…", systemImage: "tray.and.arrow.down")
+                        Spacer()
+                        if store.isScanningFolders {
+                            ProgressView().controlSize(.small)
+                        } else if store.newFoundPDFCount > 0 {
+                            Text("\(store.newFoundPDFCount)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help(store.newFoundPDFCount > 0
+                      ? "\(store.newFoundPDFCount) new PDF\(store.newFoundPDFCount == 1 ? "" : "s") found in watched folders"
+                      : "Review PDFs found in watched folders")
+            } header: {
+                sectionHeaderWithAction(
+                    title: "Watched folders",
+                    icon: "arrow.clockwise",
+                    enabled: !store.isScanningFolders,
+                    helpEnabled: "Rescan watched folders for PDFs",
+                    helpDisabled: "Scanning…",
+                    action: { Task { await store.scanWatchedFolders() } })
+            }
         }
     }
 

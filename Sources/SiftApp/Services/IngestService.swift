@@ -198,7 +198,9 @@ final class IngestService {
 
     // MARK: - Static helpers
 
-    static func sha256(of url: URL) throws -> String {
+    /// nonisolated so FolderScanService can hash candidate files off the main
+    /// actor — it's a pure function over the file's bytes.
+    nonisolated static func sha256(of url: URL) throws -> String {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var hasher = SHA256()

@@ -47,8 +47,13 @@ existing library and your papers, tags, and ratings show up.
 ## Using it
 
 - **Add:** drag a PDF onto the window, **⌘N** for a file or arXiv link, or drop
-  into `<library>/inbox/` and press **⌘R**. Double-click a row in the list to
-  open the PDF in Preview.
+  into `<library>/inbox/` and press **⌘R**. Sift can also watch folders (e.g.
+  Downloads) and offer to import new PDFs it finds — configure them in Settings.
+- **Read & Ask:** double-click a row (or **⇧⌘R**) to open the built-in reader
+  in a tab: the PDF with text highlighting you can save, a jump-to table of
+  contents, and — with an AI helper connected — a chat that answers questions
+  grounded in the paper, pre-loaded with its summary. Prefer Preview? It's in
+  the row's right-click menu.
 - **Organize:** sidebar filters by Library, Kind (papers / books / reports /
   posters), Folder, Author, and Tag; sort and search the list; rate 1–5; toggle
   read/saved; edit title, kind, and tags inline; **⌫** deletes to Trash. Click
@@ -89,11 +94,15 @@ disk are the source of truth; there's no separate database.
 
 ## Deliberately simple
 
-Sift stays focused on cataloging. It opens PDFs in Preview rather than embedding
-its own reader, and it syncs through iCloud Drive rather than running its own
-cloud. Citation export (BibTeX, RIS, DOI) may arrive later as an optional add-on.
-A Python `paper` CLI for LLM summaries, semantic search, and static-site export
-lived here until 2026-06-01 and is recoverable from git history.
+Sift stays focused: collect, tag, rate, recall — and, when you sit down to read,
+a built-in reader with highlights and a paper-grounded AI chat, so you don't
+bounce between apps to understand what you saved. It still syncs through your own
+cloud folder rather than running its own, and highlights are written into the PDF
+itself so they travel with the file (and show up in Preview too). It stays a
+catalog first: no accounts, no citation-while-you-write, no server. Citation
+export (BibTeX, RIS, DOI) may arrive later as an optional add-on. A Python
+`paper` CLI for semantic search and static-site export lived here until
+2026-06-01 and is recoverable from git history.
 
 ## License
 

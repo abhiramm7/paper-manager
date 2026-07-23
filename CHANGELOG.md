@@ -4,6 +4,30 @@ Notable changes per release. One entry per minor version; patch releases
 are folded in under the minor they belong to. For full per-release notes
 including patches see [GitHub Releases](https://github.com/abhiramm7/sift/releases).
 
+## 0.6 — Reader, watched folders, smarter attribution
+
+- **Built-in reader (Read & Ask).** Double-click a paper (or ⇧⌘R) to open it
+  in a tab: the PDF with savable text highlighting (four colors, written into
+  the PDF itself so they sync and show in Preview), a jump-to table of
+  contents from the PDF outline, and — with an AI helper connected — a chat
+  that answers questions grounded in the paper, pre-loaded with its summary.
+  Readers open as in-window tabs; Preview moved to the row's right-click menu.
+- **Watched folders.** Point Sift at folders (e.g. Downloads) in Settings; it
+  scans on launch and offers to import new PDFs it finds, de-duplicated
+  against the library by content hash. Duplicates can be moved to the Trash.
+  Optional **Assess with AI** reads each found PDF and recommends import/skip.
+- **Multi-pass attribution.** Title/author extraction is verified by extra
+  passes of a small model (haiku / local); a value is only written when two
+  passes agree. Library-wide **Verify attributions** re-checks everything.
+- **Duplicate detection.** Finds papers that are the same work stored more
+  than once (arXiv id, DOI, or title match — not just byte-identical files).
+  Surfaced via a banner and the sidebar Library header; the review sheet keeps
+  the copy you pick and folds the others' tags and rating into it before
+  trashing them.
+- **Toggleable detail panel** (⌥⌘0) and a consolidated **AI** toolbar menu.
+- **Internals.** All LLM calls funnel through one dispatch + JSON-parse +
+  provider-resolution + bulk-runner path (see CLAUDE.md → LLM operations).
+
 ## 0.5 — Library maintenance
 
 - **Manage folders** (sheet + sidebar). Rename, merge, or remove folders

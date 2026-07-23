@@ -50,9 +50,16 @@ The default on-disk folder is still named `PaperManager/` even though the app is
 Sift — kept that way so existing libraries round-trip unchanged. Users can
 choose any folder; the app uses whichever folder is configured.
 
-`paper_id` is derived from the SHA-256 of the PDF — same file ingested twice is
-a no-op. The files in iCloud are the source of truth; there is no separate
-database to migrate.
+`paper_id` is derived from the SHA-256 of the PDF **at ingest time** — same file
+ingested twice is a no-op. The files in iCloud are the source of truth; there is
+no separate database to migrate.
+
+> **Note (0.6):** the reader writes highlight annotations into `paper.pdf`
+> itself (so they sync and show in Preview), which means a paper's on-disk bytes
+> can drift from the `sha256`/`paper_id` recorded at ingest. This is fine —
+> dedupe compares a *source* file's hash to stored `metadata.sha256`, never
+> re-hashes `paper.pdf` — but don't assume `SHA-256(library/<id>/paper.pdf) == id`
+> for a paper that's been highlighted.
 
 ## Key invariants
 
@@ -82,6 +89,36 @@ database to migrate.
   management, author consolidation, and tag consolidation are reachable
   only from the sidebar — section-header icons and per-entry right-click.
   Settings shows counts and configuration knobs; no operation buttons.
+
+## LLM operations
+
+All LLM work flows through three chokepoints — add new LLM features via
+these, never by calling providers directly:
+
+- `LLMTagger.complete(prompt:using:)` — single provider dispatch (Claude CLI
+  subprocess or Ollama `/api/chat`).
+- `LLMTagger.jsonObject(from:)` — shared response cleanup (code fences,
+  stray prose) + JSON parse; every response parser uses it.
+- `LibraryStore.resolveProvider()` — provider resolution; also refreshes the
+  published `llmProvider`/`llmDiagnostic` so Settings stays honest.
+- Bulk operations share `LibraryStore.runBulk` (prime-and-refill task group,
+  `bulkConcurrency` = 3, cancellable, main-actor progress callback).
+
+`complete(prompt:using:expecting:)` takes a `ResponseFormat` — `.json` (default,
+turns on Ollama JSON mode + tight cap) or `.text` (free-form Markdown, used by
+reader Q&A).
+
+| Operation | LLMTagger entry | Model | Trigger |
+|---|---|---|---|
+| Tag/extract (title, authors, summary, tags, folder) | `extractInfo` | user's pick | ingest, toolbar AI → Tag all, detail Re-extract / Generate tags |
+| Attribution consensus (multi-pass title/authors) | `consensusTitleAuthors` | cheap (`cheapVariant`: haiku / local) | inside tagging when title/authors would change; toolbar AI → Verify attributions (library-wide) |
+| Import triage of watched-folder PDFs | `assessImport` | user's pick | review sheet "Assess with AI" (advisory only) |
+| Reader Q&A (grounded in PDF text) | `answerQuestion` (`.text`) | user's pick | reader chat panel; `LibraryStore.askPaper` |
+| Tag merges | `proposeMerges` | user's pick | sidebar Tags ✨ |
+| Author merges | `proposeAuthorMerges` (multi-pass via store) | user's pick | sidebar Authors ✨ |
+
+Attribution rule: a title/author value is only written when two passes agree
+(`consensusTitleAuthors`); no consensus → field left as-is.
 
 ## Common dev workflows
 

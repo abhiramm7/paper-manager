@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Decides whether to show onboarding or the main 3-pane UI.
+/// Decides whether to show onboarding or the main library UI.
 struct RootView: View {
     @EnvironmentObject var store: LibraryStore
     @State private var showOnboarding: Bool = !UserDefaults.standard.bool(

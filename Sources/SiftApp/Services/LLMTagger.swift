@@ -81,6 +81,15 @@ enum LLMTagger {
     /// Claude model aliases users can pick from in Settings.
     static let claudeModelChoices = ["default", "haiku", "sonnet", "opus"]
 
+    /// LLM verdict on whether a found PDF belongs in the library.
+    /// Advisory only — the user always makes the final call in the review sheet.
+    struct ImportAssessment: Equatable, Hashable, Sendable {
+        var shouldImport: Bool
+        var kind: PaperKind?     // best-guess kind when shouldImport
+        var title: String?       // real title if the LLM spotted one
+        var reason: String       // short rationale, shown as a tooltip
+    }
+
     /// One proposed tag merge from the consolidate-tags pass.
     /// `from` are the tags to be replaced (could be 1 or more); `into` is the
     /// canonical tag they all become. `reason` is a short LLM rationale.
@@ -332,15 +341,7 @@ enum LLMTagger {
             text: text,
             vocabulary: vocabulary,
             existingFolders: existingFolders)
-        let raw: String
-        switch provider {
-        case .claude(let bin, let model):
-            raw = try await runClaude(bin: bin, model: model, prompt: prompt)
-        case .ollama(let model):
-            raw = try await runOllama(model: model, prompt: prompt)
-        case .unavailable:
-            throw TaggerError.noProvider
-        }
+        let raw = try await complete(prompt: prompt, using: provider)
         return parseExtractedInfo(from: raw)
     }
 
@@ -411,6 +412,250 @@ enum LLMTagger {
         """
     }
 
+    // MARK: - Reader Q&A
+
+    /// One turn in a reader conversation about a paper.
+    struct ChatMessage: Identifiable, Equatable, Sendable {
+        enum Role: String, Sendable { case user, assistant }
+        let id: UUID
+        var role: Role
+        var text: String
+        init(role: Role, text: String) {
+            self.id = UUID()
+            self.role = role
+            self.text = text
+        }
+    }
+
+    static func buildQuestionPrompt(
+        title: String,
+        documentText: String,
+        history: [ChatMessage],
+        question: String
+    ) -> String {
+        let convo: String
+        if history.isEmpty {
+            convo = ""
+        } else {
+            convo = "\n\nConversation so far:\n" + history.map { m in
+                "\(m.role == .user ? "Q" : "A"): \(m.text)"
+            }.joined(separator: "\n")
+        }
+        return """
+        You are a careful reading assistant for a document in a personal research library. Answer the user's question about the document below.
+
+        Rules:
+        - Ground every answer in the document text. If the document doesn't contain the answer, say so plainly instead of guessing.
+        - Be concise: a few sentences for simple questions, short Markdown bullet points for multi-part ones.
+        - Quote short key phrases from the document where it helps, and name the section they come from when identifiable.
+        - Output plain Markdown. No preamble like "Based on the document".
+
+        Document title: \(title)
+
+        Document text:
+        \(documentText)\(convo)
+
+        Q: \(question)
+        A:
+        """
+    }
+
+    /// Answer a question about a document, grounded in its extracted text.
+    /// Free-form Markdown response (`.text` — no JSON mode). Throws when no
+    /// provider is available or the call fails.
+    static func answerQuestion(
+        title: String,
+        documentText: String,
+        history: [ChatMessage],
+        question: String,
+        using provider: Provider
+    ) async throws -> String {
+        let prompt = buildQuestionPrompt(
+            title: title, documentText: documentText,
+            history: history, question: question)
+        let raw = try await complete(prompt: prompt, using: provider, expecting: .text)
+        let answer = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else {
+            throw TaggerError.badResponse("empty answer")
+        }
+        return answer
+    }
+
+    // MARK: - Title/author verification (multi-pass)
+
+    /// A title+authors proposal from one extraction pass.
+    struct TitleAuthorsProposal: Equatable, Sendable {
+        var title: String?
+        var authors: [String]?
+    }
+
+    /// Cheapest usable variant of a provider, for high-volume verification
+    /// passes where a frontier model is overkill: Claude drops to haiku;
+    /// Ollama models are small already so they pass through unchanged.
+    static func cheapVariant(of provider: Provider) -> Provider {
+        switch provider {
+        case .claude(let bin, _): return .claude(binary: bin, model: "haiku")
+        case .ollama, .unavailable: return provider
+        }
+    }
+
+    static func buildTitleAuthorsPrompt(text: String) -> String {
+        """
+        Extract the title and authors of this academic document from the text of its first pages.
+
+        Output ONLY a JSON object in this exact shape — no prose, no code fences:
+
+        {"title": "The Document's Real Title", "authors": ["First Last", "Other Person"]}
+
+        Rules:
+        - "title": the document's actual title as printed on the title page, as a human-readable string. NOT the journal or venue name, NOT a running header or section heading, NOT a filename or arXiv id. Return null if you cannot identify it confidently.
+        - "authors": the human authors in the order printed. Exclude affiliations, emails, "et al.", journal and publisher names, and software tool names. Return an empty array if you cannot identify them confidently.
+
+        Text:
+        \(text)
+        """
+    }
+
+    /// One focused title/authors extraction pass.
+    static func extractTitleAuthors(
+        text: String,
+        using provider: Provider
+    ) async throws -> TitleAuthorsProposal {
+        let prompt = buildTitleAuthorsPrompt(text: text)
+        let raw = try await complete(prompt: prompt, using: provider)
+        // parseExtractedInfo tolerates the missing keys — only title/authors
+        // are present in this response.
+        let info = parseExtractedInfo(from: raw)
+        return TitleAuthorsProposal(title: info.title, authors: info.authors)
+    }
+
+    /// Multi-pass attribution: run up to `maxExtraPasses` extra cheap passes
+    /// and majority-vote title and authors independently. The seed (the main
+    /// tagging pass's proposal) counts as one vote; a value wins with 2+
+    /// agreeing votes. Fields stay nil when no consensus emerges — callers
+    /// fall back to their single-shot behavior. Stops early once both fields
+    /// have a winner, so the happy path costs a single extra cheap call.
+    static func consensusTitleAuthors(
+        text: String,
+        seed: TitleAuthorsProposal,
+        maxExtraPasses: Int = 2,
+        using provider: Provider
+    ) async -> TitleAuthorsProposal {
+        guard provider.isAvailable,
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return TitleAuthorsProposal(title: nil, authors: nil)
+        }
+        var titleVotes: [String: (count: Int, display: String)] = [:]
+        var authorVotes: [String: (count: Int, display: [String])] = [:]
+
+        func addVote(_ p: TitleAuthorsProposal) {
+            if let t = p.title, isPlausibleTitle(t), let key = titleVoteKey(t) {
+                titleVotes[key, default: (0, t)].count += 1
+            }
+            if let a = p.authors {
+                let cleaned = cleanAuthorList(a)
+                if arePlausibleAuthors(cleaned), let key = authorsVoteKey(cleaned) {
+                    authorVotes[key, default: (0, cleaned)].count += 1
+                }
+            }
+        }
+        func titleWinner() -> String? {
+            titleVotes.values.first(where: { $0.count >= 2 })?.display
+        }
+        func authorsWinner() -> [String]? {
+            authorVotes.values.first(where: { $0.count >= 2 })?.display
+        }
+
+        addVote(seed)
+        for _ in 0..<max(maxExtraPasses, 0) {
+            if titleWinner() != nil, authorsWinner() != nil { break }
+            guard let pass = try? await extractTitleAuthors(text: text, using: provider) else {
+                continue
+            }
+            addVote(pass)
+        }
+        return TitleAuthorsProposal(title: titleWinner(), authors: authorsWinner())
+    }
+
+    /// Normalized comparison key for title votes — case/whitespace/trailing-
+    /// punctuation insensitive so trivially different spellings agree.
+    static func titleVoteKey(_ t: String) -> String? {
+        let key = t.lowercased()
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .,;:"))
+        return key.isEmpty ? nil : key
+    }
+
+    /// Normalized comparison key for author-list votes. Order-sensitive —
+    /// author order is meaningful in academic attribution.
+    static func authorsVoteKey(_ authors: [String]) -> String? {
+        guard !authors.isEmpty else { return nil }
+        return authors.map { $0.lowercased() }.joined(separator: "|")
+    }
+
+    // MARK: - Import assessment
+
+    /// Ask the LLM whether a found PDF belongs in the library. Throws if no
+    /// provider is available; parse failures return a conservative "review
+    /// manually" verdict rather than throwing.
+    static func assessImport(
+        fileName: String,
+        text: String,
+        using provider: Provider
+    ) async throws -> ImportAssessment {
+        let prompt = buildAssessPrompt(fileName: fileName, text: text)
+        let raw = try await complete(prompt: prompt, using: provider)
+        return parseAssessment(from: raw)
+            ?? ImportAssessment(shouldImport: false, kind: nil, title: nil,
+                                reason: "Couldn't parse LLM verdict — review manually")
+    }
+
+    static func buildAssessPrompt(fileName: String, text: String) -> String {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        You triage PDFs for a personal research library (academic papers, books, technical reports, posters). Given a PDF's filename and the text of its first pages, decide whether it belongs in the library.
+
+        IMPORT (true): academic papers, preprints, journal articles, conference papers, textbooks, technical books, theses, dissertations, technical reports, whitepapers, standards documents, in-depth lecture notes, research posters.
+        SKIP (false): invoices, receipts, order confirmations, sales documents, contracts, legal agreements, bank or pay statements, tax forms, tickets, boarding passes, insurance or medical paperwork, product manuals, brochures, marketing material, maps, certificates, resumes, meeting slides, event programs, personal correspondence.
+
+        Output ONLY a JSON object in this exact shape — no prose, no code fences:
+
+        {"import": true, "kind": "paper", "title": "The Document's Real Title", "reason": "peer-reviewed journal article"}
+
+        Rules:
+        - "kind": one of "paper", "book", "report", "poster" when "import" is true; null when false.
+        - "title": the document's real title as a human-readable string, or null if you can't identify one.
+        - "reason": under 12 words, plain English.
+        - If the text is empty or unreadable (e.g. a scanned document), judge from the filename alone; if still unsure, return "import": false with reason "unreadable — review manually".
+
+        Filename: \(fileName)
+
+        Text:
+        \(body.isEmpty ? "(no extractable text)" : body)
+        """
+    }
+
+    /// Parse the assessment response. Tolerant of code fences and stray prose,
+    /// same as the other parsers. Returns nil when no JSON object is found.
+    static func parseAssessment(from raw: String) -> ImportAssessment? {
+        guard let obj = jsonObject(from: raw),
+              let shouldImport = obj["import"] as? Bool else { return nil }
+
+        let kind: PaperKind? = {
+            guard shouldImport, let raw = obj["kind"] as? String else { return nil }
+            return PaperKind(rawValue: raw.lowercased().trimmingCharacters(in: .whitespaces))
+        }()
+        let title: String? = {
+            guard let t = obj["title"] as? String else { return nil }
+            let cleaned = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            return cleaned.isEmpty ? nil : cleaned
+        }()
+        let reason = ((obj["reason"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ImportAssessment(shouldImport: shouldImport, kind: kind,
+                                title: title, reason: reason)
+    }
+
     // MARK: - Consolidate tags
 
     /// Build the prompt that asks the LLM to spot redundant / near-synonym tags
@@ -448,26 +693,7 @@ enum LLMTagger {
     /// Parse the LLM response into TagMergeProposal items. Tolerant of code
     /// fences and trailing prose, same as `parseExtractedInfo`.
     static func parseMerges(from raw: String) -> [TagMergeProposal] {
-        var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if working.hasPrefix("```") {
-            working = String(working.dropFirst(3))
-            if let nl = working.firstIndex(of: "\n") {
-                let lang = working[..<nl].trimmingCharacters(in: .whitespaces).lowercased()
-                if ["json", ""].contains(lang) {
-                    working = String(working[working.index(after: nl)...])
-                }
-            }
-            if let end = working.range(of: "```") {
-                working = String(working[..<end.lowerBound])
-            }
-        }
-        if let first = working.firstIndex(of: "{"),
-           let last = working.lastIndex(of: "}"),
-           first < last {
-            working = String(working[first...last])
-        }
-        guard let data = working.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let obj = jsonObject(from: raw),
               let arr = obj["merges"] as? [[String: Any]] else { return [] }
         var out: [TagMergeProposal] = []
         for item in arr {
@@ -520,26 +746,7 @@ enum LLMTagger {
     /// `parseMerges` for tags, this preserves the original case of every
     /// name — "John Smith" stays "John Smith", not "john smith".
     static func parseAuthorMerges(from raw: String) -> [AuthorMergeProposal] {
-        var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if working.hasPrefix("```") {
-            working = String(working.dropFirst(3))
-            if let nl = working.firstIndex(of: "\n") {
-                let lang = working[..<nl].trimmingCharacters(in: .whitespaces).lowercased()
-                if ["json", ""].contains(lang) {
-                    working = String(working[working.index(after: nl)...])
-                }
-            }
-            if let end = working.range(of: "```") {
-                working = String(working[..<end.lowerBound])
-            }
-        }
-        if let first = working.firstIndex(of: "{"),
-           let last = working.lastIndex(of: "}"),
-           first < last {
-            working = String(working[first...last])
-        }
-        guard let data = working.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let obj = jsonObject(from: raw),
               let arr = obj["merges"] as? [[String: Any]] else { return [] }
         var out: [AuthorMergeProposal] = []
         for item in arr {
@@ -567,15 +774,7 @@ enum LLMTagger {
             .sorted { $0.count > $1.count }
             .prefix(150))
         let prompt = buildAuthorConsolidatePrompt(authors: capped)
-        let raw: String
-        switch provider {
-        case .claude(let bin, let model):
-            raw = try await runClaude(bin: bin, model: model, prompt: prompt)
-        case .ollama(let model):
-            raw = try await runOllama(model: model, prompt: prompt)
-        case .unavailable:
-            throw TaggerError.noProvider
-        }
+        let raw = try await complete(prompt: prompt, using: provider)
         return parseAuthorMerges(from: raw)
     }
 
@@ -587,16 +786,67 @@ enum LLMTagger {
             .sorted { $0.count > $1.count }
             .prefix(100))
         let prompt = buildConsolidatePrompt(vocabulary: capped)
-        let raw: String
+        let raw = try await complete(prompt: prompt, using: provider)
+        return parseMerges(from: raw)
+    }
+
+    // MARK: - LLM plumbing (single dispatch + shared JSON parsing)
+
+    /// What shape of response an operation expects. `.json` turns on Ollama's
+    /// JSON mode and a tight output cap; `.text` allows free-form Markdown
+    /// (reader Q&A). Claude CLI ignores this — prompts carry the format rules.
+    enum ResponseFormat {
+        case json, text
+    }
+
+    /// Single chokepoint for every LLM call: routes a prompt to the active
+    /// provider and returns the raw response. All feature-level operations
+    /// (tagging, merges, import triage, attribution passes, reader Q&A) go
+    /// through here — add new LLM features by calling this, never
+    /// runClaude/runOllama directly.
+    static func complete(
+        prompt: String,
+        using provider: Provider,
+        expecting format: ResponseFormat = .json
+    ) async throws -> String {
         switch provider {
         case .claude(let bin, let model):
-            raw = try await runClaude(bin: bin, model: model, prompt: prompt)
+            return try await runClaude(bin: bin, model: model, prompt: prompt)
         case .ollama(let model):
-            raw = try await runOllama(model: model, prompt: prompt)
+            return try await runOllama(model: model, prompt: prompt, format: format)
         case .unavailable:
             throw TaggerError.noProvider
         }
-        return parseMerges(from: raw)
+    }
+
+    /// Shared response cleanup: strip markdown code fences and stray prose,
+    /// then parse the first JSON object. Every response parser goes through
+    /// here. Returns nil when no JSON object can be recovered.
+    static func jsonObject(from raw: String) -> [String: Any]? {
+        var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if working.hasPrefix("```") {
+            working = String(working.dropFirst(3))
+            if let nl = working.firstIndex(of: "\n") {
+                let lang = working[..<nl].trimmingCharacters(in: .whitespaces).lowercased()
+                if ["json", ""].contains(lang) {
+                    working = String(working[working.index(after: nl)...])
+                }
+            }
+            if let end = working.range(of: "```") {
+                working = String(working[..<end.lowerBound])
+            }
+        }
+        // Slice from first `{` to last `}` if there's leading/trailing prose.
+        if let first = working.firstIndex(of: "{"),
+           let last = working.lastIndex(of: "}"),
+           first < last {
+            working = String(working[first...last])
+        }
+        guard let data = working.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return obj
     }
 
     // MARK: - Claude CLI
@@ -662,24 +912,32 @@ enum LLMTagger {
 
     // MARK: - Ollama
 
-    static func runOllama(model: String, prompt: String) async throws -> String {
+    static func runOllama(
+        model: String,
+        prompt: String,
+        format: ResponseFormat = .json
+    ) async throws -> String {
         // Use /api/chat (not /api/generate) so `think: false` works — critical for
         // reasoning models like qwen3.5 that otherwise burn the entire output
         // budget on hidden thinking tokens.
         guard let url = URL(string: "http://127.0.0.1:11434/api/chat") else {
             throw TaggerError.llmFailed("invalid ollama URL")
         }
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "messages": [["role": "user", "content": prompt]],
             "stream": false,
             "think": false,                  // disable reasoning — qwen3.5 default-thinks for minutes otherwise
-            "format": "json",
             "options": [
                 "temperature": 0.1,
-                "num_predict": 1000,          // hard safety cap (~750 tokens of JSON; way more than we need)
+                // Hard safety cap. JSON ops need ~750 tokens; free-form
+                // reader answers get more headroom.
+                "num_predict": format == .json ? 1000 : 1600,
             ],
         ]
+        if format == .json {
+            body["format"] = "json"
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 300
@@ -716,28 +974,7 @@ enum LLMTagger {
     /// Parse the LLM response into ExtractedInfo. Tolerant of code fences,
     /// leading prose, or alternative key spellings.
     static func parseExtractedInfo(from raw: String) -> ExtractedInfo {
-        var working = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if working.hasPrefix("```") {
-            working = String(working.dropFirst(3))
-            if let nl = working.firstIndex(of: "\n") {
-                let lang = working[..<nl].trimmingCharacters(in: .whitespaces).lowercased()
-                if ["json", ""].contains(lang) {
-                    working = String(working[working.index(after: nl)...])
-                }
-            }
-            if let end = working.range(of: "```") {
-                working = String(working[..<end.lowerBound])
-            }
-        }
-        // Slice from first `{` to last `}` if there's leading/trailing prose.
-        if let first = working.firstIndex(of: "{"),
-           let last = working.lastIndex(of: "}"),
-           first < last {
-            working = String(working[first...last])
-        }
-
-        guard let data = working.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let obj = jsonObject(from: raw) else {
             return ExtractedInfo(title: nil, summary: nil, topics: [], applicationAreas: [], methods: [])
         }
 

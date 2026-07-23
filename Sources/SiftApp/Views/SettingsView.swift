@@ -28,6 +28,41 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Watched folders") {
+                Text("Sift checks these folders for PDFs at launch. Review and import what it finds from the sidebar — Watched folders → Review found PDFs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if store.watchedFolders.isEmpty {
+                    Text("No folders yet. Add one — say, Downloads — to start discovering PDFs.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ForEach(store.watchedFolders, id: \.self) { path in
+                        HStack {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                            Text((path as NSString).abbreviatingWithTildeInPath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(path)
+                            Spacer()
+                            Button {
+                                store.removeWatchedFolder(path)
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Stop watching this folder")
+                        }
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("Add folder…", action: addWatchedFolder)
+                }
+            }
+
             Section("Auto-tagging") {
                 Text("Optional. The app works without an LLM — ingest, search, ratings, and delete all work the same. Configure a provider only if you want titles, tags, and summaries filled in automatically.")
                     .font(.caption)
@@ -89,18 +124,23 @@ struct SettingsView: View {
                     }
                 }
 
-                LabeledContent("Detected") {
+                LabeledContent("Status") {
                     HStack(spacing: 8) {
+                        // Info dot, not a warning triangle: no provider is a
+                        // fine, expected state for an optional feature — it
+                        // shouldn't look like an error.
                         Image(systemName: store.llmProvider.isAvailable
-                              ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                            .foregroundStyle(store.llmProvider.isAvailable ? .green : .orange)
-                        Text(store.llmProvider.label)
+                              ? "checkmark.circle.fill" : "info.circle")
+                            .foregroundStyle(store.llmProvider.isAvailable ? .green : .secondary)
+                        Text(store.llmProvider.isAvailable
+                             ? store.llmProvider.label
+                             : "No AI helper connected (that's OK)")
                             .font(.callout)
                             .lineLimit(2)
                             .truncationMode(.middle)
                             .help(store.llmProvider.label)
                         Spacer(minLength: 8)
-                        Button("Re-detect") {
+                        Button("Check again") {
                             Task { await store.refreshLLMProvider() }
                         }
                         .fixedSize()
@@ -170,6 +210,20 @@ struct SettingsView: View {
         .onAppear {
             rootPath = store.config.iCloudRoot.path
             Task { await store.refreshLLMProvider() }
+        }
+    }
+
+    private func addWatchedFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Watch"
+        panel.message = "Choose folders for Sift to check for importable PDFs."
+        if panel.runModal() == .OK {
+            for url in panel.urls {
+                store.addWatchedFolder(url)
+            }
         }
     }
 

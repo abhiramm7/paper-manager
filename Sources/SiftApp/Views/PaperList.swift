@@ -29,19 +29,30 @@ struct PaperList: View {
             .width(14)
 
             TableColumn("Title", value: \Paper.titleSort) { p in
-                Text(p.title)
-                    .font(.body)
-                    .lineLimit(2)
-                    .onHover { hovering in
-                        // The double-click-to-open gesture is invisible without
-                        // a cursor change — Table doesn't inherit NSTableView's
-                        // built-in pointing-hand on clickable cells.
-                        if hovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
+                HStack(spacing: 6) {
+                    Text(p.title)
+                        .font(.body)
+                        .lineLimit(2)
+                    // While the LLM is filling in this paper, show a spinner +
+                    // "tagging…" so a freshly-added row (still showing its
+                    // filename as the title) doesn't look broken or stuck.
+                    if store.taggingInFlight.contains(p.id) {
+                        ProgressView().controlSize(.small)
+                        Text("tagging…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
+                }
+                .onHover { hovering in
+                    // The double-click-to-open gesture is invisible without
+                    // a cursor change — Table doesn't inherit NSTableView's
+                    // built-in pointing-hand on clickable cells.
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
             }
 
             TableColumn("Authors") { p in
@@ -97,8 +108,10 @@ struct PaperList: View {
                 rowMenu(for: p)
             }
         } primaryAction: { ids in
-            if let id = ids.first, let p = store.papers.first(where: { $0.id == id }) {
-                store.openInPreview(p)
+            // Double-click opens the built-in reader (highlights + AI Q&A).
+            // Preview is still available from the right-click menu.
+            if let id = ids.first {
+                store.openReader(for: id)
             }
         }
         .searchable(text: $searchText, placement: .toolbar, prompt: "Search title, authors, tags")
@@ -181,6 +194,7 @@ struct PaperList: View {
     @ViewBuilder
     private func rowMenu(for p: Paper) -> some View {
         let prefs = store.prefs(for: p.id)
+        Button("Read & Ask") { store.openReader(for: p.id) }
         Button("Open in Preview") { store.openInPreview(p) }
         Button("Reveal in Finder") { store.revealInFinder(p) }
         ShareLink("Share…", item: store.config.pdfURL(p.id))

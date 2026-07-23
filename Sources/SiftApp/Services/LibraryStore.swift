@@ -50,6 +50,46 @@ final class LibraryStore: ObservableObject {
     /// Library tag vocabulary — steers LLM tag generation toward existing tags.
     @Published var tagStore: TagStore
 
+    // MARK: - Watched folders
+
+    /// Folders Sift checks for importable PDFs. Absolute paths, persisted to
+    /// UserDefaults (machine-local config, like the library root — these paths
+    /// mean nothing on another Mac, so they don't belong in prefs.json).
+    @Published var watchedFolders: [String] = UserDefaults.standard
+        .stringArray(forKey: "Sift.watchedFolders") ?? [] {
+        didSet {
+            UserDefaults.standard.set(watchedFolders, forKey: "Sift.watchedFolders")
+        }
+    }
+
+    /// Result of the last watched-folder scan.
+    @Published var foundPDFs: [FoundPDF] = []
+    @Published var isScanningFolders = false
+
+    /// LLM verdicts on found PDFs, keyed by content sha256 — survives folder
+    /// re-scans (paths and mtimes change; content identity doesn't). Session-
+    /// scoped: not persisted, a fresh launch re-assesses on demand.
+    @Published var importAssessments: [String: LLMTagger.ImportAssessment] = [:]
+    /// Assessment progress. nil when idle.
+    @Published var assessProgress: (done: Int, total: Int)? = nil
+    private var assessTask: Task<Void, Never>?
+
+    /// PDFs found that aren't in the library yet — drives the sidebar badge.
+    var newFoundPDFCount: Int {
+        foundPDFs.filter { !$0.isInLibrary }.count
+    }
+
+    /// Clusters of likely-duplicate papers already in the library (same work,
+    /// different files — so ingest's byte-hash dedupe missed them). Recomputed
+    /// after every rescan.
+    @Published var duplicateGroups: [[Paper]] = []
+
+    /// Number of redundant copies across all clusters (total papers minus one
+    /// keeper per cluster) — the count worth surfacing to the user.
+    var duplicateExtraCount: Int {
+        duplicateGroups.reduce(0) { $0 + max($1.count - 1, 0) }
+    }
+
     init(config: AppConfig = AppConfig.load()) {
         self.config = config
         self.tagStore = TagStore(libraryRoot: config.iCloudRoot)
@@ -104,10 +144,312 @@ final class LibraryStore: ObservableObject {
         self.lastScanError = result.error
         // Refresh tag vocabulary from current paper set.
         self.tagStore.rebuildFromPapers(self.papers)
+        // Recompute duplicate clusters against the fresh paper set.
+        self.duplicateGroups = DuplicateFinder.findDuplicates(in: self.papers)
     }
 
     func prefs(for id: String) -> PrefsEntry {
         prefs[id] ?? PrefsEntry()
+    }
+
+    // MARK: - Watched-folder scanning
+
+    /// Scan every watched folder for PDFs and match them against the library
+    /// by SHA-256. Runs on launch and on demand from the sidebar / review
+    /// sheet. Heavy work (enumeration + hashing) happens off the main actor.
+    func scanWatchedFolders() async {
+        guard !isScanningFolders else { return }
+        guard !watchedFolders.isEmpty else {
+            foundPDFs = []
+            return
+        }
+        isScanningFolders = true
+        defer { isScanningFolders = false }
+
+        let folders = watchedFolders.map {
+            URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath)
+        }
+        var known: [String: String] = [:]   // sha256 → paper id
+        for p in papers where !p.sha256.isEmpty {
+            known[p.sha256] = p.id
+        }
+        let exclude = config.iCloudRoot
+
+        foundPDFs = await Task.detached(priority: .userInitiated) {
+            FolderScanService.scan(folders: folders,
+                                   excluding: exclude,
+                                   knownHashes: known)
+        }.value
+    }
+
+    func addWatchedFolder(_ url: URL) {
+        let path = url.standardizedFileURL.path
+        guard !watchedFolders.contains(path) else { return }
+        watchedFolders.append(path)
+        Task { await scanWatchedFolders() }
+    }
+
+    func removeWatchedFolder(_ path: String) {
+        watchedFolders.removeAll { $0 == path }
+        Task { await scanWatchedFolders() }
+    }
+
+    /// Move a found duplicate to the macOS Trash (recoverable). Drops it from
+    /// the scan results so the review sheet updates immediately.
+    func trashFoundPDF(_ f: FoundPDF) {
+        NSWorkspace.shared.recycle([f.url]) { _, _ in }
+        foundPDFs.removeAll { $0.id == f.id }
+    }
+
+    /// Run the LLM over every un-assessed new PDF in the scan results and
+    /// record an import/skip verdict for each. Advisory — nothing is imported
+    /// or deleted here. Same concurrency budget as bulk tagging. Returns
+    /// immediately; observe `assessProgress`, cancel with `cancelAssessment()`.
+    func assessFoundPDFs() {
+        guard assessTask == nil else { return }
+        let targets = foundPDFs.filter {
+            !$0.isInLibrary && importAssessments[$0.sha256] == nil
+        }
+        guard !targets.isEmpty else { return }
+        assessProgress = (0, targets.count)
+        let total = targets.count
+
+        assessTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.assessTask = nil
+                self.assessProgress = nil
+            }
+
+            let provider = await resolveProvider()
+            guard provider.isAvailable else {
+                self.lastTaggerError = "No LLM provider available."
+                return
+            }
+            // A few pages is plenty for import-or-skip; keep the prompt small
+            // even on Claude so verdicts come back fast.
+            let charCap = min(LLMTagger.maxCharsForProvider(provider), 16_000)
+
+            await self.runBulk(targets) { (f: FoundPDF) -> (String, LLMTagger.ImportAssessment?) in
+                let text = LLMTagger.extractText(
+                    from: f.url, maxChars: charCap, maxPages: 5)
+                let verdict = try? await LLMTagger.assessImport(
+                    fileName: f.fileName, text: text, using: provider)
+                return (f.sha256, verdict)
+            } onEach: { result, done in
+                if let verdict = result.1 {
+                    self.importAssessments[result.0] = verdict
+                }
+                self.assessProgress = (done, total)
+            }
+        }
+    }
+
+    /// Cancel the running assessment (if any). Verdicts already recorded stay.
+    func cancelAssessment() {
+        assessTask?.cancel()
+    }
+
+    // MARK: - Reader tabs
+
+    /// Paper ids open as reader tabs in the main window, in open order.
+    @Published var openReaderTabs: [String] = []
+    /// The active tab: a paper id, or nil for the Library tab.
+    @Published var activeReaderTab: String? = nil
+
+    func openReader(for id: String) {
+        if !openReaderTabs.contains(id) {
+            openReaderTabs.append(id)
+        }
+        activeReaderTab = id
+        seedChatIfNeeded(for: id)
+    }
+
+    /// Pre-load the paper's saved summary (summary.md, written at tagging
+    /// time) as the opening chat message — the conversation starts with
+    /// context the LLM already produced, instead of making it re-derive the
+    /// gist question by question. The seed rides along in the chat history,
+    /// so every follow-up call sees it too. No-op when a conversation
+    /// already exists or the paper has no summary.
+    private func seedChatIfNeeded(for id: String) {
+        guard (paperChats[id] ?? []).isEmpty,
+              let paper = papers.first(where: { $0.id == id }),
+              let raw = loadSummary(paper) else { return }
+        let summary = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else { return }
+        // Chat bubbles render inline Markdown only — turn "## Heading" lines
+        // into bold so they don't show as literal hash marks.
+        let cleaned = summary.replacingOccurrences(
+            of: #"(?m)^#{1,6}\s*(.+)$"#,
+            with: "**$1**",
+            options: .regularExpression)
+        paperChats[id] = [.init(
+            role: .assistant,
+            text: "Here's the saved summary of this paper:\n\n\(cleaned)")]
+    }
+
+    func closeReader(_ id: String) {
+        openReaderTabs.removeAll { $0 == id }
+        if activeReaderTab == id {
+            activeReaderTab = openReaderTabs.last
+        }
+    }
+
+    // MARK: - Reader Q&A
+
+    /// Per-paper reader conversations. Session-scoped (not persisted) —
+    /// cheap to regenerate, and answers can go stale if the PDF is re-tagged.
+    /// Lives here rather than in the view so a conversation survives closing
+    /// and reopening the reader window.
+    @Published var paperChats: [String: [LLMTagger.ChatMessage]] = [:]
+    /// Paper IDs with a reader answer currently in flight.
+    @Published var chatInFlight: Set<String> = []
+
+    /// Ask a question about a paper. Appends the question to the chat
+    /// immediately; the answer (or an error message) follows asynchronously.
+    func askPaper(_ question: String, paperId: String) {
+        let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !chatInFlight.contains(paperId) else { return }
+        guard let paper = papers.first(where: { $0.id == paperId }) else { return }
+
+        let history = paperChats[paperId] ?? []
+        paperChats[paperId] = history + [.init(role: .user, text: q)]
+        chatInFlight.insert(paperId)
+
+        let pdfURL = config.pdfURL(paperId)
+        let title = paper.title
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.chatInFlight.remove(paperId) }
+
+            let provider = await self.resolveProvider()
+            guard provider.isAvailable else {
+                self.paperChats[paperId, default: []].append(.init(
+                    role: .assistant,
+                    text: "No LLM available — configure Claude CLI or Ollama in Settings → Auto-tagging."))
+                return
+            }
+            // Whole paper on Claude (capped so per-question latency stays
+            // sane); provider cap on Ollama.
+            let charCap = min(LLMTagger.maxCharsForProvider(provider), 80_000)
+
+            var answer: String
+            do {
+                answer = try await Task.detached(priority: .userInitiated) {
+                    let text = LLMTagger.extractText(from: pdfURL, maxChars: charCap)
+                    return try await LLMTagger.answerQuestion(
+                        title: title,
+                        documentText: text,
+                        history: history,
+                        question: q,
+                        using: provider)
+                }.value
+            } catch {
+                answer = "Couldn't get an answer: \(error.localizedDescription)"
+            }
+            self.paperChats[paperId, default: []].append(.init(role: .assistant, text: answer))
+        }
+    }
+
+    func clearChat(paperId: String) {
+        paperChats.removeValue(forKey: paperId)
+    }
+
+    // MARK: - Bulk attribution verification
+
+    /// Progress of the library-wide attribution check. nil when idle.
+    @Published var verifyProgress: (done: Int, total: Int)? = nil
+    private var verifyTask: Task<Void, Never>?
+
+    /// Transient status line surfaced by ContentView's bottom overlay.
+    @Published var statusToast: String?
+
+    func showToast(_ message: String) {
+        statusToast = message
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            if self?.statusToast == message { self?.statusToast = nil }
+        }
+    }
+
+    /// Re-check title/author attribution for every paper using multiple
+    /// passes of a cheap model (haiku on Claude; the local model on Ollama).
+    /// Each paper's first pages are read 2–3 times; a title or author list is
+    /// only rewritten when two independent passes agree AND the agreed value
+    /// differs from what's stored. Observe `verifyProgress`; cancel with
+    /// `cancelVerifyAttributions()`.
+    func verifyAllAttributions() {
+        guard verifyTask == nil else { return }
+        let targets = papers
+        guard !targets.isEmpty else { return }
+        verifyProgress = (0, targets.count)
+        let total = targets.count
+
+        verifyTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.verifyTask = nil
+                self.verifyProgress = nil
+            }
+
+            let provider = await resolveProvider()
+            guard provider.isAvailable else {
+                self.lastTaggerError = "No LLM provider available."
+                return
+            }
+            let cheap = LLMTagger.cheapVariant(of: provider)
+
+            var checked = 0
+            var changed = 0
+            let cfg = self.config
+            await self.runBulk(targets) { (p: Paper) -> (String, LLMTagger.TitleAuthorsProposal) in
+                let sample = LLMTagger.extractText(
+                    from: cfg.pdfURL(p.id), maxChars: 8_000, maxPages: 2)
+                // Empty seed: consensus needs two fresh passes to agree
+                // before anything is trusted.
+                let verdict = await LLMTagger.consensusTitleAuthors(
+                    text: sample,
+                    seed: LLMTagger.TitleAuthorsProposal(title: nil, authors: nil),
+                    maxExtraPasses: 3,
+                    using: cheap)
+                return (p.id, verdict)
+            } onEach: { result, done in
+                if self.applyVerifiedAttribution(result.1, to: result.0) {
+                    changed += 1
+                }
+                checked = done
+                self.verifyProgress = (done, total)
+            }
+            self.showToast("Checked \(checked) paper\(checked == 1 ? "" : "s") — corrected \(changed).")
+        }
+    }
+
+    /// Cancel the running attribution check. Corrections already made stay.
+    func cancelVerifyAttributions() {
+        verifyTask?.cancel()
+    }
+
+    /// Write a consensus verdict to disk if it's plausible and actually
+    /// different from what's stored. Returns true when something changed.
+    private func applyVerifiedAttribution(
+        _ v: LLMTagger.TitleAuthorsProposal, to id: String
+    ) -> Bool {
+        guard let p = papers.first(where: { $0.id == id }) else { return false }
+        let newTitle: String? = {
+            guard let t = v.title, LLMTagger.isPlausibleTitle(t) else { return nil }
+            return LLMTagger.titleVoteKey(t) == LLMTagger.titleVoteKey(p.title) ? nil : t
+        }()
+        let newAuthors: [String]? = {
+            guard let a = v.authors, LLMTagger.arePlausibleAuthors(a) else { return nil }
+            return LLMTagger.authorsVoteKey(a) == LLMTagger.authorsVoteKey(p.authors) ? nil : a
+        }()
+        guard newTitle != nil || newAuthors != nil else { return false }
+        updateMetadata(id: id) { obj in
+            if let t = newTitle { obj["title"] = t }
+            if let a = newAuthors { obj["authors"] = a }
+        }
+        return true
     }
 
     /// All unique tags across the library (user_tags ∪ auto.tags).
@@ -219,11 +561,57 @@ final class LibraryStore: ObservableObject {
         let dir = config.paperDir(id)
         NSWorkspace.shared.recycle([dir]) { _, _ in }
         papers.removeAll { $0.id == id }
+        closeReader(id)   // a reader tab on a trashed paper would dangle
         // Always rewrite prefs.json — a prior session may have written an entry
         // even if this session never loaded it. Without this, deleted papers
         // leave ghost prefs entries on disk that accumulate over time.
         prefs.removeValue(forKey: id)
         writePrefs()
+        // A trashed paper may have been part of a duplicate cluster.
+        duplicateGroups = DuplicateFinder.findDuplicates(in: papers)
+    }
+
+    // MARK: - Duplicate resolution
+
+    /// Resolve a duplicate cluster: keep `keepID`, fold the others' useful
+    /// state into it (user tags, and rating/saved when the keeper lacks them),
+    /// then move the redundant copies to the Trash. Nothing is lost — the
+    /// keeper inherits the best metadata, and trashed files stay recoverable.
+    func resolveDuplicates(keep keepID: String, trash trashIDs: [String]) {
+        guard papers.contains(where: { $0.id == keepID }) else { return }
+        let losers = trashIDs.filter { $0 != keepID }
+        guard !losers.isEmpty else { return }
+
+        // Merge user tags from every loser into the keeper.
+        var mergedTags = papers.first(where: { $0.id == keepID })?.user_tags ?? []
+        var seen = Set(mergedTags.map { $0.lowercased() })
+        for lid in losers {
+            guard let lp = papers.first(where: { $0.id == lid }) else { continue }
+            for t in lp.user_tags where seen.insert(t.lowercased()).inserted {
+                mergedTags.append(t)
+            }
+        }
+        if mergedTags != (papers.first(where: { $0.id == keepID })?.user_tags ?? []) {
+            setUserTags(mergedTags, for: keepID)
+        }
+
+        // Inherit rating / saved / read from a loser only where the keeper is
+        // unset — the user's explicit choice on the keeper always wins.
+        var keeperPrefs = prefs[keepID] ?? PrefsEntry()
+        for lid in losers {
+            let lp = prefs[lid] ?? PrefsEntry()
+            if keeperPrefs.rating == nil, let r = lp.rating { keeperPrefs.rating = r }
+            if !keeperPrefs.saved, lp.saved { keeperPrefs.saved = true }
+            if !keeperPrefs.read, lp.read { keeperPrefs.read = true }
+        }
+        keeperPrefs.updated_at = Self.isoNow()
+        prefs[keepID] = keeperPrefs
+        writePrefs()
+
+        // Trash the redundant copies (deletePaper recomputes duplicateGroups).
+        for lid in losers {
+            deletePaper(lid)
+        }
     }
 
     // MARK: - Metadata edits (write back to metadata.json)
@@ -295,13 +683,22 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - LLM tagging
 
-    func refreshLLMProvider() async {
+    /// Resolve the active provider for an LLM operation. Every feature-level
+    /// LLM entry point in this class goes through here, so provider-selection
+    /// logic lives in exactly one place — and each resolution also refreshes
+    /// the published `llmProvider`/`llmDiagnostic`, keeping Settings honest.
+    func resolveProvider() async -> LLMTagger.Provider {
         let (p, diag) = await LLMTagger.detectProvider(
             llmPreference,
             claudeModel: claudeModel,
             ollamaModel: ollamaModel)
         self.llmProvider = p
         self.llmDiagnostic = diag
+        return p
+    }
+
+    func refreshLLMProvider() async {
+        _ = await resolveProvider()
         self.availableOllamaModels = await LLMTagger.listOllamaChatModels()
     }
 
@@ -324,8 +721,43 @@ final class LibraryStore: ObservableObject {
     /// Per-paper task handles for individual (non-bulk) tagging. Cancellable.
     private var taggingTasks: [String: Task<Void, Never>] = [:]
 
-    /// How many papers to tag concurrently in bulk mode.
-    static let bulkConcurrency = 3
+    /// How many papers to tag concurrently in bulk mode. nonisolated: it's an
+    /// immutable constant, and `runBulk`'s default parameter is evaluated in
+    /// a nonisolated context.
+    nonisolated static let bulkConcurrency = 3
+
+    /// Shared prime-and-refill loop for every bulk LLM operation (tag all,
+    /// assess found PDFs, verify attributions): keeps `width` workers in
+    /// flight, invokes `onEach` on the main actor after every completion (in
+    /// completion order, with a running done-count), and stops refilling when
+    /// the surrounding task is cancelled.
+    private func runBulk<T: Sendable, R: Sendable>(
+        _ items: [T],
+        width: Int = LibraryStore.bulkConcurrency,
+        worker: @escaping @Sendable (T) async -> R,
+        onEach: (R, _ done: Int) -> Void
+    ) async {
+        var done = 0
+        var iter = items.makeIterator()
+        await withTaskGroup(of: R.self) { group in
+            for _ in 0..<min(width, items.count) {
+                if let item = iter.next() {
+                    group.addTask { await worker(item) }
+                }
+            }
+            while let result = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                done += 1
+                onEach(result, done)
+                if let item = iter.next() {
+                    group.addTask { await worker(item) }
+                }
+            }
+        }
+    }
 
     /// How much of the PDF the LLM sees.
     enum TaggingMode {
@@ -358,8 +790,7 @@ final class LibraryStore: ObservableObject {
     /// Ask the LLM to look at the current tag vocabulary and propose merges.
     /// Throws if no provider is available.
     func proposeTagMerges() async throws -> [LLMTagger.TagMergeProposal] {
-        let (provider, _) = await LLMTagger.detectProvider(
-            llmPreference, claudeModel: claudeModel, ollamaModel: ollamaModel)
+        let provider = await resolveProvider()
         guard provider.isAvailable else { throw LLMTagger.TaggerError.noProvider }
         let vocab = Array(tagStore.vocabulary.values)
         return try await LLMTagger.proposeMerges(vocabulary: vocab, using: provider)
@@ -426,8 +857,7 @@ final class LibraryStore: ObservableObject {
     /// Ask the LLM to look at the current author vocabulary and propose merges
     /// for names that are the same person under different spellings.
     func proposeAuthorMerges() async throws -> [LLMTagger.AuthorMergeProposal] {
-        let (provider, _) = await LLMTagger.detectProvider(
-            llmPreference, claudeModel: claudeModel, ollamaModel: ollamaModel)
+        let provider = await resolveProvider()
         guard provider.isAvailable else { throw LLMTagger.TaggerError.noProvider }
         let authors = allAuthors.map { (name: $0.author, count: $0.count) }
         return try await LLMTagger.proposeAuthorMerges(authors: authors, using: provider)
@@ -458,8 +888,7 @@ final class LibraryStore: ObservableObject {
         maxPasses: Int = 3,
         onPass: @MainActor @escaping (Int, Int) -> Void
     ) async throws -> [LLMTagger.AuthorMergeProposal] {
-        let (provider, _) = await LLMTagger.detectProvider(
-            llmPreference, claudeModel: claudeModel, ollamaModel: ollamaModel)
+        let provider = await resolveProvider()
         guard provider.isAvailable else { throw LLMTagger.TaggerError.noProvider }
 
         var simulated = allAuthors.map { (name: $0.author, count: $0.count) }
@@ -647,32 +1076,10 @@ final class LibraryStore: ObservableObject {
                 self.bulkTagTask = nil
                 self.bulkTagProgress = nil
             }
-
-            var done = 0
-            var iter = ids.makeIterator()
-
-            await withTaskGroup(of: Void.self) { group in
-                let primeCount = min(Self.bulkConcurrency, total)
-                for _ in 0..<primeCount {
-                    if let id = iter.next() {
-                        group.addTask { [weak self] in
-                            await self?.runTagging(for: id, force: false, mode: .fast)
-                        }
-                    }
-                }
-                while await group.next() != nil {
-                    if Task.isCancelled {
-                        group.cancelAll()
-                        break
-                    }
-                    done += 1
-                    self.bulkTagProgress = (done, total)
-                    if let id = iter.next() {
-                        group.addTask { [weak self] in
-                            await self?.runTagging(for: id, force: false, mode: .fast)
-                        }
-                    }
-                }
+            await self.runBulk(ids) { [weak self] id in
+                await self?.runTagging(for: id, force: false, mode: .fast)
+            } onEach: { _, done in
+                self.bulkTagProgress = (done, total)
             }
         }
     }
@@ -720,10 +1127,7 @@ final class LibraryStore: ObservableObject {
         }
 
         // Provider must be resolved on the main actor (reads model prefs).
-        let (provider, _) = await LLMTagger.detectProvider(
-            llmPreference,
-            claudeModel: claudeModel,
-            ollamaModel: ollamaModel)
+        let provider = await resolveProvider()
         guard provider.isAvailable else {
             self.lastTaggerError = "No LLM provider available."
             return
@@ -777,20 +1181,46 @@ final class LibraryStore: ObservableObject {
                 canon.folder = LLMTagger.canonicalizeFolder(f, against: existingFolders)
             }
 
+            // Multi-pass attribution check. Wrong title/author attribution is
+            // the most visible tagging failure, so before rewriting either
+            // field, get second (and if needed third) opinions from a cheap
+            // model and require two votes to agree. The main pass's proposal
+            // is the seed vote; on disagreement with no majority, fields fall
+            // back to the single-shot proposal below.
+            var verified = LLMTagger.TitleAuthorsProposal(
+                title: canon.title, authors: canon.authors)
+            let titleNeedsWork = force || LLMTagger.isLikelyBadTitle(existingTitle)
+            let authorsNeedWork = force || LLMTagger.areLikelyBadAuthors(existingAuthors)
+            if titleNeedsWork || authorsNeedWork {
+                let cheap = LLMTagger.cheapVariant(of: provider)
+                let seed = verified
+                let consensus = await Task.detached(priority: .utility) {
+                    () -> LLMTagger.TitleAuthorsProposal in
+                    // Attribution lives on the first pages — a small sample
+                    // keeps the verification passes fast and cheap.
+                    let sample = LLMTagger.extractText(
+                        from: pdfURL, maxChars: 8_000, maxPages: 2)
+                    return await LLMTagger.consensusTitleAuthors(
+                        text: sample, seed: seed, using: cheap)
+                }.value
+                if let t = consensus.title { verified.title = t }
+                if let a = consensus.authors { verified.authors = a }
+            }
+
             // Title: on the conservative path (force=false, bulk), only
             // overwrite when the existing one looks bad. On force=true
-            // (user-triggered re-extract), accept any plausible LLM title —
-            // the whole point of re-extract is to fix titles the heuristic
-            // misses.
+            // (user-triggered re-extract), accept any plausible verified
+            // title — the whole point of re-extract is to fix titles the
+            // heuristic misses.
             let titleUpdate: String? = {
-                guard let proposed = canon.title,
+                guard let proposed = verified.title,
                       LLMTagger.isPlausibleTitle(proposed) else { return nil }
                 if force { return proposed != existingTitle ? proposed : nil }
                 return LLMTagger.isLikelyBadTitle(existingTitle) ? proposed : nil
             }()
             // Same logic for authors.
             let authorsUpdate: [String]? = {
-                guard let proposed = canon.authors,
+                guard let proposed = verified.authors,
                       LLMTagger.arePlausibleAuthors(proposed) else { return nil }
                 if force { return proposed != existingAuthors ? proposed : nil }
                 return LLMTagger.areLikelyBadAuthors(existingAuthors) ? proposed : nil

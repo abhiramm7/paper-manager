@@ -12,10 +12,13 @@ struct SiftApp: App {
                 .task {
                     await store.rescan()
                     // Detect the LLM provider on launch — otherwise the
-                    // Re-extract / Tag all / Regenerate buttons stay greyed
-                    // out until the user opens Settings (which triggers
-                    // refresh as a side effect).
+                    // Re-extract and AI-menu actions stay greyed out until
+                    // the user opens Settings (which triggers refresh as a
+                    // side effect).
                     await store.refreshLLMProvider()
+                    // Check watched folders for importable PDFs. Runs after
+                    // rescan so the library hashes are loaded for dedupe.
+                    await store.scanWatchedFolders()
                 }
         }
         .commands {
@@ -46,4 +49,6 @@ struct SiftApp: App {
 extension Notification.Name {
     static let showAddSheet = Notification.Name("Sift.showAddSheet")
     static let refreshLibrary = Notification.Name("Sift.refreshLibrary")
+    static let showImportReview = Notification.Name("Sift.showImportReview")
+    static let showDuplicates = Notification.Name("Sift.showDuplicates")
 }

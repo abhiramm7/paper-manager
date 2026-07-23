@@ -207,11 +207,15 @@ struct PaperDetail: View {
     private var actionRow: some View {
         HStack(spacing: 8) {
             Button {
-                store.openInPreview(paper)
+                store.openReader(for: paper.id)
             } label: {
-                Label("Open in Preview", systemImage: "doc.richtext")
+                Label("Read & Ask", systemImage: "text.book.closed")
             }
-            .keyboardShortcut("o", modifiers: .command)
+            .buttonStyle(.borderedProminent)   // the primary action for a paper
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .help("Open a reader tab with highlighting and AI Q&A (⇧⌘R)")
+            // "Open in Preview" intentionally has no button here — the reader
+            // is the default; Preview lives in the list's right-click menu.
 
             Button {
                 store.revealInFinder(paper)
@@ -317,6 +321,7 @@ struct PaperDetail: View {
         let apps = filterAutoTags(paper.auto?.application_areas ?? [], against: userTags)
         let methods = filterAutoTags(paper.auto?.methods ?? [], against: userTags)
         let isTagging = store.taggingInFlight.contains(paper.id)
+        let hasAutoTags = !(paper.auto?.tags?.isEmpty ?? true)
         return VStack(alignment: .leading, spacing: 8) {
             // User tags row — always shown with the inline add field so the
             // user always has a path to add their own tag even on cold start.
@@ -346,7 +351,10 @@ struct PaperDetail: View {
                         .buttonStyle(.borderless)
                         .help("Stop tagging this paper")
                     }
-                } else {
+                } else if !hasAutoTags {
+                    // Cold-start affordance only. Once tags exist, the
+                    // action-row "Re-extract" is the single regenerate path —
+                    // a second "Regenerate" here just duplicated it.
                     generateTagsButton
                 }
                 Spacer()
@@ -487,20 +495,21 @@ struct PaperDetail: View {
               : "No LLM detected — open Settings to choose Claude or Ollama.")
     }
 
+    /// Cold-start only: shown in the tags row when a paper has no auto tags
+    /// yet. Regeneration of an already-tagged paper goes through the
+    /// action-row "Re-extract" button (same call), so this stays single-purpose.
     private var generateTagsButton: some View {
-        let hasAuto = !(paper.auto?.tags?.isEmpty ?? true)
-        return Button {
-            // Manual regenerate reads the whole paper (Claude) / provider cap (Ollama).
+        Button {
             store.generateTagsInBackground(for: paper.id, force: true, mode: .full)
         } label: {
-            Label(hasAuto ? "Regenerate" : "Generate tags", systemImage: "sparkles")
+            Label("Generate tags", systemImage: "sparkles")
                 .font(.caption)
         }
         .buttonStyle(.borderless)
         .controlSize(.small)
         .disabled(!store.llmProvider.isAvailable)
         .help(store.llmProvider.isAvailable
-              ? "Run \(store.llmProvider.label) over the full paper to regenerate tags, title, authors, summary"
+              ? "Run \(store.llmProvider.label) over the full paper to fill in tags, title, authors, and summary"
               : "No LLM detected. Install Claude Code or run Ollama with a chat model.")
     }
 
