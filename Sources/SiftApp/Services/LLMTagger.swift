@@ -40,13 +40,11 @@ enum LLMTagger {
             return true
         }
 
-        var modelName: String? {
-            switch self {
-            case .claude(_, let m): return m
-            case .ollama(let m): return m
-            case .unavailable: return nil
-            }
-        }
+        /// What every greyed-out AI control says. Six views had six slightly
+        /// different sentences for the same state; this is the one.
+        static let missingHint =
+            "No LLM detected — connect Claude or Ollama in Settings → Auto-tagging."
+
     }
 
     /// LLM-extracted info: title, authors, summary, categorized tags, folder.
@@ -308,14 +306,18 @@ enum LLMTagger {
         guard let doc = PDFDocument(url: pdf) else { return "" }
         var out = ""
         out.reserveCapacity(min(maxChars, 32_768))
+        // Track the length as we go: `String.count` is O(n), so testing it once
+        // per page turned a long book into a quadratic scan.
+        var length = 0
         let pageLimit = min(doc.pageCount, maxPages)
         for i in 0..<pageLimit {
-            if out.count >= maxChars { break }
+            if length >= maxChars { break }
             guard let page = doc.page(at: i), let s = page.string else { continue }
             out += s
             out += "\n"
+            length += s.count + 1
         }
-        if out.count > maxChars {
+        if length > maxChars {
             return String(out.prefix(maxChars))
         }
         return out
@@ -559,11 +561,21 @@ enum LLMTagger {
                 }
             }
         }
+        // Most-voted candidate wins, ties broken by key so the result doesn't
+        // depend on dictionary iteration order.
         func titleWinner() -> String? {
-            titleVotes.values.first(where: { $0.count >= 2 })?.display
+            titleVotes
+                .filter { $0.value.count >= 2 }
+                .max { a, b in
+                    a.value.count != b.value.count ? a.value.count < b.value.count : a.key > b.key
+                }?.value.display
         }
         func authorsWinner() -> [String]? {
-            authorVotes.values.first(where: { $0.count >= 2 })?.display
+            authorVotes
+                .filter { $0.value.count >= 2 }
+                .max { a, b in
+                    a.value.count != b.value.count ? a.value.count < b.value.count : a.key > b.key
+                }?.value.display
         }
 
         addVote(seed)
@@ -693,18 +705,34 @@ enum LLMTagger {
     /// Parse the LLM response into TagMergeProposal items. Tolerant of code
     /// fences and trailing prose, same as `parseExtractedInfo`.
     static func parseMerges(from raw: String) -> [TagMergeProposal] {
+        parseMergeItems(from: raw, lowercased: true).map {
+            TagMergeProposal(from: $0.from, into: $0.into, reason: $0.reason)
+        }
+    }
+
+    /// Both consolidation passes answer in the same shape —
+    /// `{"merges": [{"from": [...], "into": "...", "reason": "..."}]}` — so
+    /// they share one parser. Tags are a lowercase vocabulary; author names
+    /// keep whatever casing the model returned. Entries that merge into
+    /// themselves are dropped either way.
+    private static func parseMergeItems(
+        from raw: String,
+        lowercased: Bool
+    ) -> [(from: [String], into: String, reason: String)] {
         guard let obj = jsonObject(from: raw),
               let arr = obj["merges"] as? [[String: Any]] else { return [] }
-        var out: [TagMergeProposal] = []
+        func clean(_ s: String) -> String {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return lowercased ? trimmed.lowercased() : trimmed
+        }
+        var out: [(from: [String], into: String, reason: String)] = []
         for item in arr {
-            let from = stringArray(from: item["from"]).map { $0.lowercased() }.filter { !$0.isEmpty }
-            let into = (item["into"] as? String)?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let reason = (item["reason"] as? String) ?? ""
+            let from = stringArray(from: item["from"]).map(clean).filter { !$0.isEmpty }
+            let into = clean((item["into"] as? String) ?? "")
             guard !into.isEmpty, !from.isEmpty else { continue }
-            // Filter out the into tag from `from` if the LLM duplicated it.
-            let filtered = from.filter { $0 != into }
+            let filtered = from.filter { $0.lowercased() != into.lowercased() }
             guard !filtered.isEmpty else { continue }
-            out.append(TagMergeProposal(from: filtered, into: into, reason: reason))
+            out.append((filtered, into, (item["reason"] as? String) ?? ""))
         }
         return out
     }
@@ -746,23 +774,9 @@ enum LLMTagger {
     /// `parseMerges` for tags, this preserves the original case of every
     /// name — "John Smith" stays "John Smith", not "john smith".
     static func parseAuthorMerges(from raw: String) -> [AuthorMergeProposal] {
-        guard let obj = jsonObject(from: raw),
-              let arr = obj["merges"] as? [[String: Any]] else { return [] }
-        var out: [AuthorMergeProposal] = []
-        for item in arr {
-            let from = stringArray(from: item["from"])
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            let into = ((item["into"] as? String) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let reason = (item["reason"] as? String) ?? ""
-            guard !into.isEmpty, !from.isEmpty else { continue }
-            // Drop any from-entries that equal the into target (case-insensitively).
-            let filtered = from.filter { $0.lowercased() != into.lowercased() }
-            guard !filtered.isEmpty else { continue }
-            out.append(AuthorMergeProposal(from: filtered, into: into, reason: reason))
+        parseMergeItems(from: raw, lowercased: false).map {
+            AuthorMergeProposal(from: $0.from, into: $0.into, reason: $0.reason)
         }
-        return out
     }
 
     /// Ask the LLM to propose author merges. Throws if no provider is available.
@@ -852,62 +866,120 @@ enum LLMTagger {
     // MARK: - Claude CLI
 
     /// Holder for a running Process so a cancellation handler can terminate it.
+    /// Locked: the cancellation handler runs on an arbitrary thread and can
+    /// fire before — or during — the child's launch. Recording the cancel lets
+    /// a late `attach` refuse to start a subprocess nobody is waiting for.
     private final class ProcessHolder: @unchecked Sendable {
-        var proc: Process?
-        func terminate() { proc?.terminate() }
+        private let lock = NSLock()
+        private var proc: Process?
+        private var cancelled = false
+
+        /// Register the process. Returns false if cancellation already fired,
+        /// in which case the caller must not run it.
+        func attach(_ p: Process) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !cancelled else { return false }
+            proc = p
+            return true
+        }
+
+        func terminate() {
+            lock.lock()
+            cancelled = true
+            let p = proc
+            lock.unlock()
+            p?.terminate()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
+    /// Thread-safe byte sink for draining a child's pipe off the main flow.
+    private final class DataBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = Data()
+        func set(_ d: Data) { lock.lock(); storage = d; lock.unlock() }
+        var value: Data { lock.lock(); defer { lock.unlock() }; return storage }
     }
 
     /// Invoke `claude -p` with the prompt piped via stdin. argv has a length
     /// limit; stdin is unbounded. Cancels the subprocess if the task is cancelled.
+    ///
+    /// stdin, stdout and stderr are all pumped on background queues *before*
+    /// waiting on the child. Doing any of them inline deadlocks as soon as the
+    /// data exceeds the ~64 KB pipe buffer: the child blocks writing its answer
+    /// while we block waiting for it to exit (or vice versa for a long prompt).
     static func runClaude(bin: URL, model: String?, prompt: String) async throws -> String {
         let holder = ProcessHolder()
         return try await withTaskCancellationHandler {
-            try await Task.detached(priority: .userInitiated) { () -> String in
-                let proc = Process()
-                proc.executableURL = bin
-                var args = ["-p", "--no-session-persistence"]
-                if let m = model, !m.isEmpty {
-                    args.append(contentsOf: ["--model", m])
-                }
-                proc.arguments = args
-
-                let inPipe = Pipe()
-                let outPipe = Pipe()
-                let errPipe = Pipe()
-                proc.standardInput = inPipe
-                proc.standardOutput = outPipe
-                proc.standardError = errPipe
-                holder.proc = proc
-
-                do {
-                    try proc.run()
-                } catch {
-                    throw TaggerError.llmFailed("could not launch claude: \(error.localizedDescription)")
-                }
-
-                if let data = prompt.data(using: .utf8) {
-                    try? inPipe.fileHandleForWriting.write(contentsOf: data)
-                }
-                try? inPipe.fileHandleForWriting.close()
-
-                proc.waitUntilExit()
-
-                if Task.isCancelled {
-                    throw CancellationError()
-                }
-
-                let outData = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
-                let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
-
-                if proc.terminationStatus != 0 {
-                    let msg = String(data: errData, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
-                    throw TaggerError.llmFailed(msg.trimmingCharacters(in: .whitespacesAndNewlines))
-                }
-                return String(data: outData, encoding: .utf8) ?? ""
+            try await Task.detached(priority: .userInitiated) {
+                try runClaudeBlocking(bin: bin, model: model, prompt: prompt, holder: holder)
             }.value
         } onCancel: {
             holder.terminate()
         }
+    }
+
+    /// The blocking half of `runClaude`, kept synchronous so it can wait on the
+    /// pipe pumps. Always called from a detached task.
+    private static func runClaudeBlocking(
+        bin: URL, model: String?, prompt: String, holder: ProcessHolder
+    ) throws -> String {
+        let proc = Process()
+        proc.executableURL = bin
+        var args = ["-p", "--no-session-persistence"]
+        if let m = model, !m.isEmpty {
+            args.append(contentsOf: ["--model", m])
+        }
+        proc.arguments = args
+
+        let inPipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        guard holder.attach(proc) else { throw CancellationError() }
+
+        do {
+            try proc.run()
+        } catch {
+            throw TaggerError.llmFailed("could not launch claude: \(error.localizedDescription)")
+        }
+
+        let outBox = DataBox()
+        let errBox = DataBox()
+        let pumps = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        queue.async(group: pumps) {
+            outBox.set((try? outPipe.fileHandleForReading.readToEnd()) ?? Data())
+        }
+        queue.async(group: pumps) {
+            errBox.set((try? errPipe.fileHandleForReading.readToEnd()) ?? Data())
+        }
+        let promptData = Data(prompt.utf8)
+        queue.async(group: pumps) {
+            let handle = inPipe.fileHandleForWriting
+            try? handle.write(contentsOf: promptData)
+            try? handle.close()
+        }
+
+        proc.waitUntilExit()
+        pumps.wait()
+
+        if holder.isCancelled { throw CancellationError() }
+
+        if proc.terminationStatus != 0 {
+            let msg = String(data: errBox.value, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
+            throw TaggerError.llmFailed(msg.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return String(data: outBox.value, encoding: .utf8) ?? ""
     }
 
     // MARK: - Ollama

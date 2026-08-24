@@ -31,6 +31,30 @@ struct SiftApp: App {
                     NotificationCenter.default.post(name: .refreshLibrary, object: nil)
                 }
                 .keyboardShortcut("r", modifiers: .command)
+                // Safari's ⌘W: closes the reader tab you're on, and falls
+                // through to closing the window when you're on Library.
+                Button("Close Tab") {
+                    NotificationCenter.default.post(name: .closeActiveTab, object: nil)
+                }
+                .keyboardShortcut("w", modifiers: .command)
+            }
+            // Find lives in the Edit menu, where ⌘F belongs. ⌘F focuses the
+            // one toolbar search field — library filter or find-in-PDF,
+            // depending on the tab you're on; ⌘G walks the PDF matches.
+            CommandGroup(after: .textEditing) {
+                Divider()
+                Button("Find") {
+                    NotificationCenter.default.post(name: .focusSearchField, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: .command)
+                Button("Find Next") {
+                    NotificationCenter.default.post(name: .findNext, object: nil)
+                }
+                .keyboardShortcut("g", modifiers: .command)
+                Button("Find Previous") {
+                    NotificationCenter.default.post(name: .findPrevious, object: nil)
+                }
+                .keyboardShortcut("g", modifiers: [.shift, .command])
             }
             CommandGroup(replacing: .help) {
                 Link("Open repo README",
@@ -51,4 +75,8 @@ extension Notification.Name {
     static let refreshLibrary = Notification.Name("Sift.refreshLibrary")
     static let showImportReview = Notification.Name("Sift.showImportReview")
     static let showDuplicates = Notification.Name("Sift.showDuplicates")
+    static let closeActiveTab = Notification.Name("Sift.closeActiveTab")
+    static let focusSearchField = Notification.Name("Sift.focusSearchField")
+    static let findNext = Notification.Name("Sift.findNext")
+    static let findPrevious = Notification.Name("Sift.findPrevious")
 }

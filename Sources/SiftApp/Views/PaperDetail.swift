@@ -228,8 +228,7 @@ struct PaperDetail: View {
             }
             .help("Share the PDF — AirDrop, Mail, Messages, Notes, etc.")
 
-            if let arxiv = paper.arxiv_id, !arxiv.isEmpty,
-               let url = URL(string: "https://arxiv.org/abs/\(arxiv)") {
+            if let url = paper.arxivURL {
                 Button {
                     NSWorkspace.shared.open(url)
                 } label: {
@@ -292,6 +291,17 @@ struct PaperDetail: View {
             .padding(.trailing, 12)
 
             Toggle(isOn: Binding(
+                get: { prefs.reading },
+                set: { store.setReading($0, for: paper.id) }
+            )) {
+                Label("Reading", systemImage: prefs.reading ? "book.fill" : "book")
+            }
+            .toggleStyle(.button)
+            .help(prefs.reading
+                  ? "Unpin from Currently reading"
+                  : "Pin to the Currently reading section at the top of the list")
+
+            Toggle(isOn: Binding(
                 get: { prefs.read },
                 set: { store.setRead($0, for: paper.id) }
             )) {
@@ -299,7 +309,7 @@ struct PaperDetail: View {
                       systemImage: prefs.read ? "checkmark.circle.fill" : "circle")
             }
             .toggleStyle(.button)
-            .help(prefs.read ? "Mark as unread" : "Mark as read")
+            .help(prefs.read ? "Mark as unread" : "Mark as read (clears Reading)")
 
             Toggle(isOn: Binding(
                 get: { prefs.saved },
@@ -327,13 +337,13 @@ struct PaperDetail: View {
             // user always has a path to add their own tag even on cold start.
             userTagsRow(userTags: userTags)
             if !topics.isEmpty {
-                tagChipRow(label: "Topics", tags: topics, style: .auto)
+                tagChipRow(label: "Topics", tags: topics)
             }
             if !apps.isEmpty {
-                tagChipRow(label: "Applications", tags: apps, style: .auto)
+                tagChipRow(label: "Applications", tags: apps)
             }
             if !methods.isEmpty {
-                tagChipRow(label: "Methods", tags: methods, style: .auto)
+                tagChipRow(label: "Methods", tags: methods)
             }
             HStack(spacing: 8) {
                 if isTagging {
@@ -425,9 +435,9 @@ struct PaperDetail: View {
         newTagDraft = ""
     }
 
-    private enum ChipStyle { case user, auto }
-
-    private func tagChipRow(label: String, tags: [String], style: ChipStyle) -> some View {
+    /// A labelled row of LLM-assigned tags. User tags have their own row with
+    /// an editor (`userTagsRow`), so these chips are always the outline style.
+    private func tagChipRow(label: String, tags: [String]) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(label)
                 .font(.caption.weight(.medium))
@@ -436,29 +446,14 @@ struct PaperDetail: View {
                 .padding(.top, 3)
             FlowLayout(spacing: 6) {
                 ForEach(tags, id: \.self) { t in
-                    chip(t, style: style)
+                    Text(t)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .overlay(Capsule().stroke(Color.secondary.opacity(0.5), lineWidth: 1))
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private func chip(_ text: String, style: ChipStyle) -> some View {
-        switch style {
-        case .user:
-            Text("#\(text)")
-                .font(.caption)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Capsule().fill(Color.accentColor.opacity(0.18)))
-                .foregroundStyle(.primary)
-        case .auto:
-            Text(text)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .overlay(Capsule().stroke(Color.secondary.opacity(0.5), lineWidth: 1))
         }
     }
 
@@ -492,7 +487,7 @@ struct PaperDetail: View {
         .disabled(inFlight || !providerAvailable)
         .help(providerAvailable
               ? "Re-run the LLM to refresh title, authors, tags, summary, and folder."
-              : "No LLM detected — open Settings to choose Claude or Ollama.")
+              : LLMTagger.Provider.missingHint)
     }
 
     /// Cold-start only: shown in the tags row when a paper has no auto tags
@@ -510,7 +505,7 @@ struct PaperDetail: View {
         .disabled(!store.llmProvider.isAvailable)
         .help(store.llmProvider.isAvailable
               ? "Run \(store.llmProvider.label) over the full paper to fill in tags, title, authors, and summary"
-              : "No LLM detected. Install Claude Code or run Ollama with a chat model.")
+              : LLMTagger.Provider.missingHint)
     }
 
     private var metaGrid: some View {
@@ -531,57 +526,22 @@ struct PaperDetail: View {
         }
     }
 
+    private static let addedDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        return f
+    }()
+
     private static func formatAdded(_ iso: String) -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        guard let d = f.date(from: iso) else { return iso }
-        let out = DateFormatter()
-        out.dateStyle = .medium
-        out.timeStyle = .none
-        return out.string(from: d)
+        guard let d = ISO8601.internetDateTime.date(from: iso) else { return iso }
+        return addedDateFormatter.string(from: d)
     }
 
     private func metaRow(_ label: String, _ value: String) -> some View {
         GridRow {
             Text(label).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
             Text(value).textSelection(.enabled)
-        }
-    }
-
-    private func autoBlock(_ title: String, items: [String]?, bulleted: Bool = false) -> some View {
-        Group {
-            if let items, !items.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title).font(.subheadline.weight(.semibold))
-                    if bulleted {
-                        ForEach(items, id: \.self) { item in
-                            HStack(alignment: .top, spacing: 6) {
-                                Text("•").foregroundStyle(.secondary)
-                                Text(item).textSelection(.enabled)
-                            }
-                            .font(.callout)
-                        }
-                    } else {
-                        Text(items.joined(separator: ", "))
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
-                }
-            }
-        }
-    }
-
-    private func codeLinks(_ links: [CodeLink]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Code").font(.subheadline.weight(.semibold))
-            ForEach(links, id: \.url) { link in
-                if let url = URL(string: link.url) {
-                    Link(link.url, destination: url)
-                        .font(.callout)
-                        .lineLimit(1)
-                }
-            }
         }
     }
 

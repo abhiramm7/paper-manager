@@ -6,8 +6,20 @@ import AppKit
 final class LibraryStore: ObservableObject {
     @Published var papers: [Paper] = []
     @Published var prefs: PrefsMap = [:]
-    @Published var config: AppConfig
+    /// Library root + derived paths. Reassigning this (Settings → Apply,
+    /// first-run onboarding) re-points the tag vocabulary at the new library —
+    /// without that, tags.json keeps being written into whichever folder the
+    /// app happened to launch with.
+    @Published var config: AppConfig {
+        didSet {
+            guard oldValue.iCloudRoot != config.iCloudRoot else { return }
+            tagStore = TagStore(libraryRoot: config.iCloudRoot)
+        }
+    }
     @Published var isScanning = false
+    /// Last library-level failure (unreadable library dir, failed metadata
+    /// write). Surfaced as a dismissable banner in ContentView; cleared by a
+    /// successful rescan.
     @Published var lastScanError: String?
 
     /// Paper IDs currently mid-LLM-tagging. Views can use this for spinners.
@@ -66,6 +78,42 @@ final class LibraryStore: ObservableObject {
     @Published var foundPDFs: [FoundPDF] = []
     @Published var isScanningFolders = false
 
+    /// Remembered SHA-256s for watched-folder files, keyed by path and guarded
+    /// by (size, mtime). Hashing is the whole cost of a scan, and scans run on
+    /// every launch — without this, pointing Sift at a folder of GBs of PDFs
+    /// re-reads all of them every time. Persisted because the launch scan is
+    /// exactly the one worth making cheap. Machine-local (absolute paths), so
+    /// it lives in Application Support, not in the synced library.
+    private var scanCache: ScanCache = LibraryStore.loadScanCache()
+
+    /// `~/Library/Application Support/Sift/scan-cache.json`.
+    private static var scanCacheURL: URL? {
+        guard let base = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        return base
+            .appendingPathComponent("Sift", isDirectory: true)
+            .appendingPathComponent("scan-cache.json")
+    }
+
+    private static func loadScanCache() -> ScanCache {
+        guard let url = scanCacheURL,
+              let data = try? Data(contentsOf: url),
+              let decoded = try? JSONDecoder().decode(ScanCache.self, from: data) else { return [:] }
+        return decoded
+    }
+
+    /// Write the cache off the main actor — it can hold thousands of entries
+    /// and nothing waits on the result.
+    private static func saveScanCache(_ cache: ScanCache) {
+        guard let url = scanCacheURL else { return }
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(cache) else { return }
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
     /// LLM verdicts on found PDFs, keyed by content sha256 — survives folder
     /// re-scans (paths and mtimes change; content identity doesn't). Session-
     /// scoped: not persisted, a fresh launch re-assesses on demand.
@@ -90,6 +138,35 @@ final class LibraryStore: ObservableObject {
         duplicateGroups.reduce(0) { $0 + max($1.count - 1, 0) }
     }
 
+    // MARK: - Cached aggregates
+    //
+    // These used to be computed properties. The sidebar reads each of them
+    // several times per render and the toolbar read `untaggedCount` (which
+    // hit the disk once per paper), so every published change re-walked the
+    // whole library. They're recomputed once, in `recomputeAggregates()`,
+    // whenever `papers` changes.
+
+    /// Paper IDs with a non-empty summary.md on disk. Refreshed by `rescan()`
+    /// and kept in sync by the tagger, so `paperNeedsTagging` never touches
+    /// the filesystem.
+    @Published private(set) var papersWithSummary: Set<String> = []
+    /// How many papers still need LLM work — drives the AI menu's label.
+    @Published private(set) var untaggedCount: Int = 0
+    /// All unique tags across the library (user_tags ∪ auto.tags).
+    @Published private(set) var allTags: [(tag: String, count: Int)] = []
+    /// All unique folders across the library, with paper counts. Uses each
+    /// paper's `effectiveFolder` (user override if set, else the LLM's
+    /// auto-assigned folder). Case-folded for uniqueness; the displayed name
+    /// is the most common spelling among papers that share that key.
+    @Published private(set) var allFolders: [(folder: String, count: Int)] = []
+    /// All authors across the library with paper counts. Every author across
+    /// every position counts — so a paper by ["Abhiram", "Branko"] contributes
+    /// one to each name. Case-folded dedup; the displayed spelling is the
+    /// most common one for that case-folded key. "et al." junk is stripped
+    /// here too, so libraries with dirty data still see clean sidebars before
+    /// the consolidate pass runs.
+    @Published private(set) var allAuthors: [(author: String, count: Int)] = []
+
     init(config: AppConfig = AppConfig.load()) {
         self.config = config
         self.tagStore = TagStore(libraryRoot: config.iCloudRoot)
@@ -100,9 +177,10 @@ final class LibraryStore: ObservableObject {
         defer { isScanning = false }
 
         let cfg = self.config
-        let result = await Task.detached(priority: .userInitiated) { () -> (papers: [Paper], prefs: PrefsMap, error: String?) in
+        let result = await Task.detached(priority: .userInitiated) { () -> (papers: [Paper], prefs: PrefsMap, summaries: Set<String>, error: String?) in
             var papers: [Paper] = []
             var prefs: PrefsMap = [:]
+            var summaries: Set<String> = []
             var firstError: String?
 
             let fm = FileManager.default
@@ -118,6 +196,15 @@ final class LibraryStore: ObservableObject {
                         let data = try Data(contentsOf: meta)
                         let p = try JSONDecoder().decode(Paper.self, from: data)
                         papers.append(p)
+                        // Note which papers already have a summary while we're
+                        // walking the directory anyway — that keeps
+                        // `paperNeedsTagging` (called from view bodies) off
+                        // the filesystem entirely.
+                        let summary = url.appendingPathComponent("summary.md")
+                        if let vals = try? summary.resourceValues(forKeys: [.fileSizeKey]),
+                           (vals.fileSize ?? 0) > 0 {
+                            summaries.insert(p.id)
+                        }
                     } catch {
                         if firstError == nil {
                             firstError = "Failed to decode \(meta.lastPathComponent) in \(url.lastPathComponent): \(error.localizedDescription)"
@@ -134,18 +221,64 @@ final class LibraryStore: ObservableObject {
                 prefs = map
             }
 
-            return (papers, prefs, firstError)
+            return (papers, prefs, summaries, firstError)
         }.value
 
         self.papers = result.papers.sorted { lhs, rhs in
             (lhs.addedDate ?? .distantPast) > (rhs.addedDate ?? .distantPast)
         }
         self.prefs = result.prefs
+        self.papersWithSummary = result.summaries
         self.lastScanError = result.error
         // Refresh tag vocabulary from current paper set.
         self.tagStore.rebuildFromPapers(self.papers)
         // Recompute duplicate clusters against the fresh paper set.
         self.duplicateGroups = DuplicateFinder.findDuplicates(in: self.papers)
+        recomputeAggregates()
+    }
+
+    /// Rebuild every cached aggregate from `papers`. Called whenever the paper
+    /// set or a paper's metadata changes — one pass instead of the handful of
+    /// full-library walks the computed-property versions cost per render.
+    private func recomputeAggregates() {
+        var tagCounts: [String: Int] = [:]
+        var folderCounts: [String: Int] = [:]
+        var folderDisplays: [String: [String: Int]] = [:]
+        var authorCounts: [String: Int] = [:]
+        var authorDisplays: [String: [String: Int]] = [:]
+        var untagged = 0
+
+        for p in papers {
+            for t in p.allTags {
+                tagCounts[t, default: 0] += 1
+            }
+            if let f = p.effectiveFolder?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !f.isEmpty {
+                let key = f.lowercased()
+                folderCounts[key, default: 0] += 1
+                folderDisplays[key, default: [:]][f, default: 0] += 1
+            }
+            for a in p.authors {
+                guard let cleaned = LLMTagger.cleanAuthorName(a) else { continue }
+                let key = cleaned.lowercased()
+                authorCounts[key, default: 0] += 1
+                authorDisplays[key, default: [:]][cleaned, default: 0] += 1
+            }
+            if paperNeedsTagging(p) { untagged += 1 }
+        }
+
+        allTags = tagCounts
+            .map { ($0.key, $0.value) }
+            .sorted { $0.count > $1.count || ($0.count == $1.count && $0.tag < $1.tag) }
+        allFolders = folderCounts.map { (key, count) -> (folder: String, count: Int) in
+            (folderDisplays[key]?.max(by: { $0.value < $1.value })?.key ?? key, count)
+        }
+        .sorted { $0.count > $1.count || ($0.count == $1.count && $0.folder < $1.folder) }
+        allAuthors = authorCounts.map { (key, count) -> (author: String, count: Int) in
+            (authorDisplays[key]?.max(by: { $0.value < $1.value })?.key ?? key, count)
+        }
+        .sorted { $0.count > $1.count || ($0.count == $1.count && $0.author < $1.author) }
+        untaggedCount = untagged
     }
 
     func prefs(for id: String) -> PrefsEntry {
@@ -174,12 +307,17 @@ final class LibraryStore: ObservableObject {
             known[p.sha256] = p.id
         }
         let exclude = config.iCloudRoot
+        let cache = scanCache
 
-        foundPDFs = await Task.detached(priority: .userInitiated) {
+        let result = await Task.detached(priority: .userInitiated) {
             FolderScanService.scan(folders: folders,
                                    excluding: exclude,
-                                   knownHashes: known)
+                                   knownHashes: known,
+                                   cache: cache)
         }.value
+        foundPDFs = result.found
+        scanCache = result.cache
+        Self.saveScanCache(result.cache)
     }
 
     func addWatchedFolder(_ url: URL) {
@@ -221,11 +359,7 @@ final class LibraryStore: ObservableObject {
                 self.assessProgress = nil
             }
 
-            let provider = await resolveProvider()
-            guard provider.isAvailable else {
-                self.lastTaggerError = "No LLM provider available."
-                return
-            }
+            guard let provider = await self.availableProvider() else { return }
             // A few pages is plenty for import-or-skip; keep the prompt small
             // even on Claude so verdicts come back fast.
             let charCap = min(LLMTagger.maxCharsForProvider(provider), 16_000)
@@ -262,6 +396,12 @@ final class LibraryStore: ObservableObject {
             openReaderTabs.append(id)
         }
         activeReaderTab = id
+        // Opening a paper to read is the clearest signal there is that you're
+        // reading it — pin it without making the user say so twice. Marking it
+        // read (or toggling it off by hand) unpins it.
+        if !prefs(for: id).read {
+            setReading(true, for: id)
+        }
         seedChatIfNeeded(for: id)
     }
 
@@ -293,6 +433,39 @@ final class LibraryStore: ObservableObject {
         if activeReaderTab == id {
             activeReaderTab = openReaderTabs.last
         }
+        findQuery.removeValue(forKey: id)
+        findStatus.removeValue(forKey: id)
+    }
+
+    // MARK: - Find in PDF
+
+    /// How far along the current find is, for the toolbar's "3 of 17".
+    /// `index` is 1-based; zero means nothing matched. `searching` covers the
+    /// gap while PDFKit scans a long document — without it the toolbar would
+    /// claim "Not found" for the seconds a first search over a book takes.
+    struct FindStatus: Equatable {
+        var count: Int = 0
+        var index: Int = 0
+        var searching: Bool = false
+    }
+
+    /// A single character matches half a paper and buries the reader in
+    /// highlights, so a find only runs from two characters up.
+    static let minFindLength = 2
+
+    /// Find-in-PDF query per reader tab. The toolbar search field writes it
+    /// (it searches the library on the Library tab and the PDF on a reader
+    /// tab); the matching `ReaderView` watches its own entry and runs the
+    /// search. Session state — deliberately not persisted.
+    @Published var findQuery: [String: String] = [:]
+    /// Match count + position, written back by the reader for the toolbar.
+    @Published var findStatus: [String: FindStatus] = [:]
+
+    /// The active tab's find query, trimmed — empty when on Library or when
+    /// nothing has been typed.
+    var activeFindQuery: String {
+        guard let id = activeReaderTab else { return "" }
+        return (findQuery[id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Reader Q&A
@@ -327,7 +500,7 @@ final class LibraryStore: ObservableObject {
             guard provider.isAvailable else {
                 self.paperChats[paperId, default: []].append(.init(
                     role: .assistant,
-                    text: "No LLM available — configure Claude CLI or Ollama in Settings → Auto-tagging."))
+                    text: LLMTagger.Provider.missingHint))
                 return
             }
             // Whole paper on Claude (capped so per-question latency stays
@@ -373,6 +546,14 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    /// Record an LLM-operation failure. Keeps it in `lastTaggerError` and puts
+    /// it in front of the user — these used to be written and never read, so
+    /// a failed tagging run looked identical to one that did nothing.
+    func reportTaggerError(_ message: String) {
+        lastTaggerError = message
+        showToast(message)
+    }
+
     /// Re-check title/author attribution for every paper using multiple
     /// passes of a cheap model (haiku on Claude; the local model on Ollama).
     /// Each paper's first pages are read 2–3 times; a title or author list is
@@ -393,11 +574,7 @@ final class LibraryStore: ObservableObject {
                 self.verifyProgress = nil
             }
 
-            let provider = await resolveProvider()
-            guard provider.isAvailable else {
-                self.lastTaggerError = "No LLM provider available."
-                return
-            }
+            guard let provider = await self.availableProvider() else { return }
             let cheap = LLMTagger.cheapVariant(of: provider)
 
             var checked = 0
@@ -452,69 +629,11 @@ final class LibraryStore: ObservableObject {
         return true
     }
 
-    /// All unique tags across the library (user_tags ∪ auto.tags).
-    var allTags: [(tag: String, count: Int)] {
-        var counts: [String: Int] = [:]
-        for p in papers {
-            for t in p.allTags {
-                counts[t, default: 0] += 1
-            }
-        }
-        return counts
-            .map { ($0.key, $0.value) }
-            .sorted { $0.count > $1.count || ($0.count == $1.count && $0.tag < $1.tag) }
-    }
-
-    /// All unique folders across the library, with paper counts. Uses each
-    /// paper's `effectiveFolder` (user override if set, else the LLM's
-    /// auto-assigned folder). Case-folded for uniqueness; the displayed name
-    /// is the most common spelling among papers that share that key.
-    var allFolders: [(folder: String, count: Int)] {
-        var counts: [String: Int] = [:]
-        var displays: [String: [String: Int]] = [:]  // key -> {spelling -> count}
-        for p in papers {
-            guard let f = p.effectiveFolder?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !f.isEmpty else { continue }
-            let key = f.lowercased()
-            counts[key, default: 0] += 1
-            displays[key, default: [:]][f, default: 0] += 1
-        }
-        return counts.map { (key, count) -> (folder: String, count: Int) in
-            let display = displays[key]?.max(by: { $0.value < $1.value })?.key ?? key
-            return (display, count)
-        }
-        .sorted { $0.count > $1.count || ($0.count == $1.count && $0.folder < $1.folder) }
-    }
-
     /// Folder names in their current canonical spelling, for the LLM prompt.
     /// Includes user-set folders so the LLM will reuse names the user has
     /// adopted, not just ones the LLM previously invented.
     var folderVocabulary: [String] {
         allFolders.map { $0.folder }
-    }
-
-    /// All authors across the library with paper counts. Every author across
-    /// every position counts — so a paper by ["Abhiram", "Branko"] contributes
-    /// one to each name. Case-folded dedup; the displayed spelling is the
-    /// most common one for that case-folded key. "et al." junk is stripped
-    /// at display time too, so libraries with dirty data still see clean
-    /// sidebars before the consolidate pass runs.
-    var allAuthors: [(author: String, count: Int)] {
-        var counts: [String: Int] = [:]
-        var displays: [String: [String: Int]] = [:]
-        for p in papers {
-            for a in p.authors {
-                guard let cleaned = LLMTagger.cleanAuthorName(a) else { continue }
-                let key = cleaned.lowercased()
-                counts[key, default: 0] += 1
-                displays[key, default: [:]][cleaned, default: 0] += 1
-            }
-        }
-        return counts.map { (key, count) -> (author: String, count: Int) in
-            let display = displays[key]?.max(by: { $0.value < $1.value })?.key ?? key
-            return (display, count)
-        }
-        .sorted { $0.count > $1.count || ($0.count == $1.count && $0.author < $1.author) }
     }
 
     func openInPreview(_ paper: Paper) {
@@ -538,21 +657,42 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Mutations (write back to prefs.json)
 
-    /// rating: -1 (down), 1..5 (stars), or nil to clear. Matches Python prefs.set_rating.
-    func setRating(_ rating: Int?, for id: String) {
+    /// Read-modify-write one paper's prefs entry: stamps `updated_at` and
+    /// flushes prefs.json. Every prefs mutation goes through here, the way
+    /// every metadata.json edit goes through `updateMetadata`.
+    private func updatePrefs(for id: String, mutate: (inout PrefsEntry) -> Void) {
         var e = prefs[id] ?? PrefsEntry()
-        e.rating = rating
-        e.updated_at = Self.isoNow()
+        mutate(&e)
+        e.updated_at = ISO8601.now()
         prefs[id] = e
         writePrefs()
     }
 
+    /// rating: -1 (down), 1..5 (stars), or nil to clear. Matches Python prefs.set_rating.
+    func setRating(_ rating: Int?, for id: String) {
+        updatePrefs(for: id) { $0.rating = rating }
+    }
+
     func setRead(_ read: Bool, for id: String) {
-        var e = prefs[id] ?? PrefsEntry()
-        e.read = read
-        e.updated_at = Self.isoNow()
-        prefs[id] = e
-        writePrefs()
+        updatePrefs(for: id) {
+            $0.read = read
+            // Finishing a paper takes it off the "Currently reading" shelf.
+            if read { $0.reading = false }
+        }
+    }
+
+    /// Pin/unpin the paper in the "Currently reading" section at the top of
+    /// the list. Marking it reading also clears `read` — the two states are
+    /// mutually exclusive by definition.
+    func setReading(_ reading: Bool, for id: String) {
+        updatePrefs(for: id) {
+            $0.reading = reading
+            if reading { $0.read = false }
+        }
+    }
+
+    func setStarred(_ saved: Bool, for id: String) {
+        updatePrefs(for: id) { $0.saved = saved }
     }
 
     /// Move the paper's library/<id>/ folder to the Trash and drop it from
@@ -561,6 +701,7 @@ final class LibraryStore: ObservableObject {
         let dir = config.paperDir(id)
         NSWorkspace.shared.recycle([dir]) { _, _ in }
         papers.removeAll { $0.id == id }
+        papersWithSummary.remove(id)
         closeReader(id)   // a reader tab on a trashed paper would dangle
         // Always rewrite prefs.json — a prior session may have written an entry
         // even if this session never loaded it. Without this, deleted papers
@@ -569,6 +710,7 @@ final class LibraryStore: ObservableObject {
         writePrefs()
         // A trashed paper may have been part of a duplicate cluster.
         duplicateGroups = DuplicateFinder.findDuplicates(in: papers)
+        recomputeAggregates()
     }
 
     // MARK: - Duplicate resolution
@@ -597,16 +739,14 @@ final class LibraryStore: ObservableObject {
 
         // Inherit rating / saved / read from a loser only where the keeper is
         // unset — the user's explicit choice on the keeper always wins.
-        var keeperPrefs = prefs[keepID] ?? PrefsEntry()
-        for lid in losers {
-            let lp = prefs[lid] ?? PrefsEntry()
-            if keeperPrefs.rating == nil, let r = lp.rating { keeperPrefs.rating = r }
-            if !keeperPrefs.saved, lp.saved { keeperPrefs.saved = true }
-            if !keeperPrefs.read, lp.read { keeperPrefs.read = true }
+        updatePrefs(for: keepID) { keeper in
+            for lid in losers {
+                let lp = prefs[lid] ?? PrefsEntry()
+                if keeper.rating == nil, let r = lp.rating { keeper.rating = r }
+                if !keeper.saved, lp.saved { keeper.saved = true }
+                if !keeper.read, lp.read { keeper.read = true }
+            }
         }
-        keeperPrefs.updated_at = Self.isoNow()
-        prefs[keepID] = keeperPrefs
-        writePrefs()
 
         // Trash the redundant copies (deletePaper recomputes duplicateGroups).
         for lid in losers {
@@ -619,19 +759,34 @@ final class LibraryStore: ObservableObject {
     /// Read-modify-write a paper's metadata.json on disk. Then refresh that
     /// paper's entry in `papers` so the UI sees the change.
     private func updateMetadata(id: String, mutate: (inout [String: Any]) -> Void) {
+        if rewriteMetadata(id: id, mutate: mutate) {
+            refreshPaperOnDisk(id: id)
+        }
+    }
+
+    /// The disk half of `updateMetadata`, without the per-paper refresh —
+    /// library-wide passes (tag/author merges) rewrite many files and then
+    /// reload everything once with `rescan()`. Returns whether it wrote.
+    /// Silent when `mutate` leaves the JSON untouched, so a no-op merge
+    /// doesn't churn iCloud files.
+    @discardableResult
+    private func rewriteMetadata(id: String, mutate: (inout [String: Any]) -> Void) -> Bool {
         let url = config.metadataURL(id)
         guard let data = try? Data(contentsOf: url),
-              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+              let loaded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             lastScanError = "Couldn't read \(url.lastPathComponent)"
-            return
+            return false
         }
+        var obj = loaded
         mutate(&obj)
+        guard !NSDictionary(dictionary: obj).isEqual(to: loaded) else { return false }
         do {
             let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
             try out.write(to: url, options: .atomic)
-            refreshPaperOnDisk(id: id)
+            return true
         } catch {
             lastScanError = "Couldn't save \(url.lastPathComponent): \(error.localizedDescription)"
+            return false
         }
     }
 
@@ -673,20 +828,23 @@ final class LibraryStore: ObservableObject {
         setUserTags(new, for: id)
     }
 
-    func setStarred(_ saved: Bool, for id: String) {
-        var e = prefs[id] ?? PrefsEntry()
-        e.saved = saved
-        e.updated_at = Self.isoNow()
-        prefs[id] = e
-        writePrefs()
-    }
-
     // MARK: - LLM tagging
 
     /// Resolve the active provider for an LLM operation. Every feature-level
     /// LLM entry point in this class goes through here, so provider-selection
     /// logic lives in exactly one place — and each resolution also refreshes
     /// the published `llmProvider`/`llmDiagnostic`, keeping Settings honest.
+    /// `resolveProvider()` for jobs that can't run without one: reports the
+    /// standard hint and returns nil so the caller just bails.
+    private func availableProvider() async -> LLMTagger.Provider? {
+        let provider = await resolveProvider()
+        guard provider.isAvailable else {
+            reportTaggerError(LLMTagger.Provider.missingHint)
+            return nil
+        }
+        return provider
+    }
+
     func resolveProvider() async -> LLMTagger.Provider {
         let (p, diag) = await LLMTagger.detectProvider(
             llmPreference,
@@ -709,6 +867,7 @@ final class LibraryStore: ObservableObject {
               let p = try? JSONDecoder().decode(Paper.self, from: data) else { return }
         if let idx = papers.firstIndex(where: { $0.id == id }) {
             papers[idx] = p
+            recomputeAggregates()
         }
     }
 
@@ -814,36 +973,17 @@ final class LibraryStore: ObservableObject {
         guard !renames.isEmpty else { return }
 
         for p in papers {
-            let metaURL = config.metadataURL(p.id)
-            guard let data = try? Data(contentsOf: metaURL),
-                  var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-            var changed = false
-            // Top-level user_tags
-            if var ut = obj["user_tags"] as? [String] {
-                let renamed = Self.renameList(ut, with: renames)
-                if renamed != ut { ut = renamed; obj["user_tags"] = ut; changed = true }
-            }
-            // auto.*
-            if var auto = obj["auto"] as? [String: Any] {
-                for key in ["tags", "topics", "application_areas", "methods"] {
-                    if let arr = auto[key] as? [String] {
-                        let renamed = Self.renameList(arr, with: renames)
-                        if renamed != arr {
-                            auto[key] = renamed
-                            changed = true
+            rewriteMetadata(id: p.id) { obj in
+                if let ut = obj["user_tags"] as? [String] {
+                    obj["user_tags"] = Self.renameList(ut, with: renames, lowercased: true)
+                }
+                if var auto = obj["auto"] as? [String: Any] {
+                    for key in ["tags", "topics", "application_areas", "methods"] {
+                        if let arr = auto[key] as? [String] {
+                            auto[key] = Self.renameList(arr, with: renames, lowercased: true)
                         }
                     }
-                }
-                if changed { obj["auto"] = auto }
-            }
-            if changed {
-                do {
-                    let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-                    try out.write(to: metaURL, options: .atomic)
-                } catch {
-                    lastScanError = "Couldn't rewrite \(metaURL.lastPathComponent): \(error.localizedDescription)"
+                    obj["auto"] = auto
                 }
             }
         }
@@ -853,15 +993,6 @@ final class LibraryStore: ObservableObject {
     }
 
     // MARK: - Consolidate authors
-
-    /// Ask the LLM to look at the current author vocabulary and propose merges
-    /// for names that are the same person under different spellings.
-    func proposeAuthorMerges() async throws -> [LLMTagger.AuthorMergeProposal] {
-        let provider = await resolveProvider()
-        guard provider.isAvailable else { throw LLMTagger.TaggerError.noProvider }
-        let authors = allAuthors.map { (name: $0.author, count: $0.count) }
-        return try await LLMTagger.proposeAuthorMerges(authors: authors, using: provider)
-    }
 
     /// Strip "et al." junk from every paper's `authors[]` on disk. Idempotent:
     /// only rewrites a paper if its cleaned list differs from what's stored.
@@ -953,27 +1084,10 @@ final class LibraryStore: ObservableObject {
         guard !renames.isEmpty else { return }
 
         for p in papers {
-            let metaURL = config.metadataURL(p.id)
-            guard let data = try? Data(contentsOf: metaURL),
-                  var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let existing = obj["authors"] as? [String] else { continue }
-
-            let renamed = existing.map { renames[$0.lowercased()] ?? $0 }
-            // Dedup case-insensitively, preserve first-seen casing
-            var seen = Set<String>()
-            var deduped: [String] = []
-            for a in renamed {
-                if seen.insert(a.lowercased()).inserted {
-                    deduped.append(a)
+            rewriteMetadata(id: p.id) { obj in
+                if let existing = obj["authors"] as? [String] {
+                    obj["authors"] = Self.renameList(existing, with: renames, lowercased: false)
                 }
-            }
-            guard deduped != existing else { continue }
-            obj["authors"] = deduped
-            do {
-                let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-                try out.write(to: metaURL, options: .atomic)
-            } catch {
-                lastScanError = "Couldn't rewrite \(metaURL.lastPathComponent): \(error.localizedDescription)"
             }
         }
         Task { await self.rescan() }
@@ -1018,28 +1132,34 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    /// Dedupe-preserving list rename: applies `renames` to each entry and drops
-    /// duplicates (case-insensitive) while preserving original order.
-    nonisolated private static func renameList(_ list: [String], with renames: [String: String]) -> [String] {
+    /// Dedupe-preserving list rename: applies `renames` (keyed by lowercased
+    /// name) to each entry and drops case-insensitive duplicates, preserving
+    /// order. Tags are a lowercase vocabulary, so they pass `lowercased: true`;
+    /// author names keep the casing the merge target was written with.
+    nonisolated private static func renameList(
+        _ list: [String],
+        with renames: [String: String],
+        lowercased: Bool
+    ) -> [String] {
         var seen = Set<String>()
         var out: [String] = []
-        for t in list {
-            let lower = t.lowercased()
-            let new = renames[lower] ?? lower
-            if seen.insert(new).inserted {
-                out.append(new)
+        for name in list {
+            let renamed = renames[name.lowercased()] ?? (lowercased ? name.lowercased() : name)
+            if seen.insert(renamed.lowercased()).inserted {
+                out.append(renamed)
             }
         }
         return out
     }
 
     /// True if the paper still needs LLM work: tags, title, authors, summary,
-    /// or folder missing/bad.
+    /// or folder missing/bad. Reads only in-memory state (`papersWithSummary`
+    /// stands in for summary.md) so it's safe to call from a view body.
     func paperNeedsTagging(_ p: Paper) -> Bool {
         let noTags = p.auto?.tags?.isEmpty ?? true
         let badTitle = LLMTagger.isLikelyBadTitle(p.title)
         let badAuthors = LLMTagger.areLikelyBadAuthors(p.authors)
-        let noSummary = (loadSummary(p) ?? "").isEmpty
+        let noSummary = !papersWithSummary.contains(p.id)
         let noFolder = (p.auto?.folder?.isEmpty ?? true)
         return noTags || badTitle || badAuthors || noSummary || noFolder
     }
@@ -1127,11 +1247,7 @@ final class LibraryStore: ObservableObject {
         }
 
         // Provider must be resolved on the main actor (reads model prefs).
-        let provider = await resolveProvider()
-        guard provider.isAvailable else {
-            self.lastTaggerError = "No LLM provider available."
-            return
-        }
+        guard let provider = await availableProvider() else { return }
 
         // Heavy work off the main actor: PDF text extraction + LLM call.
         // Trim text to fit the active provider's context budget AND the chosen mode.
@@ -1163,7 +1279,10 @@ final class LibraryStore: ObservableObject {
 
         switch result {
         case .failure(let error):
-            self.lastTaggerError = error.localizedDescription
+            // A user-initiated stop isn't a failure worth shouting about.
+            if !(error is CancellationError) {
+                self.reportTaggerError(error.localizedDescription)
+            }
             return
         case .success(let info):
             guard !info.isEmpty else { return }
@@ -1236,9 +1355,10 @@ final class LibraryStore: ObservableObject {
                     // means we already passed the hasSummary guard above for any paper
                     // that gets here — so it's safe to write.)
                     try s.write(to: summaryURL, atomically: true, encoding: .utf8)
+                    papersWithSummary.insert(id)
                 }
             } catch {
-                self.lastTaggerError = "write failed: \(error.localizedDescription)"
+                self.reportTaggerError("Couldn't save tagging results: \(error.localizedDescription)")
                 return
             }
             refreshPaperOnDisk(id: id)
@@ -1291,13 +1411,5 @@ final class LibraryStore: ObservableObject {
         } catch {
             lastScanError = "Failed to write prefs.json: \(error.localizedDescription)"
         }
-    }
-
-    private static func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        // Python uses "+00:00" rather than "Z"; ISO8601DateFormatter emits "Z" by default,
-        // which is the same UTC instant and round-trips fine through both decoders.
-        return f.string(from: Date())
     }
 }

@@ -76,7 +76,8 @@ What it does:
   - Sifts through research papers and books — collect, tag, rate, recall.
   - Stores everything as plain files in a folder you choose (recommended:
     inside iCloud Drive, so it syncs across your devices).
-  - Opens PDFs in Preview (the system default app).
+  - Opens PDFs in a built-in reader: highlight text, search the PDF, and
+    ask questions about it. Preview is still one right-click away.
 
 First-run setup:
   On first launch you'll be asked where to keep your library. The default is

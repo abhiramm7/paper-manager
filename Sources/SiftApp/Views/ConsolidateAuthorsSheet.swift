@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// Sheet that runs `LibraryStore.proposeAuthorMerges()`, displays the LLM-
-/// proposed merges ("J. Smith" → "John Smith", "Smith, John" → "John Smith"),
-/// lets the user check/uncheck each one, then applies them.
+/// Sheet that runs `LibraryStore.proposeAuthorMergesThorough(maxPasses:onPass:)`,
+/// displays the LLM-proposed merges ("J. Smith" → "John Smith", "Smith, John"
+/// → "John Smith"), lets the user check/uncheck each one, then applies them.
 struct ConsolidateAuthorsSheet: View {
     @EnvironmentObject var store: LibraryStore
     @Environment(\.dismiss) private var dismiss

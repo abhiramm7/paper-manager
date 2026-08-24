@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject var store: LibraryStore
 
     @State private var rootPath: String = ""
+    @State private var rootStatus: (message: String, isError: Bool)?
 
     var body: some View {
         Form {
@@ -16,15 +17,16 @@ struct SettingsView: View {
                         Button("Choose…", action: chooseFolder)
                     }
                 }
+                if let note = rootStatus {
+                    Text(note.message)
+                        .font(.caption)
+                        .foregroundStyle(note.isError ? .red : .secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 HStack {
                     Spacer()
-                    Button("Apply") {
-                        let url = URL(fileURLWithPath: (rootPath as NSString).expandingTildeInPath)
-                        store.config = AppConfig(iCloudRoot: url)
-                        store.config.save()
-                        Task { await store.rescan() }
-                    }
-                    .disabled(rootPath.isEmpty)
+                    Button("Apply", action: applyRoot)
+                        .disabled(rootPath.isEmpty)
                 }
             }
 
@@ -211,6 +213,25 @@ struct SettingsView: View {
             rootPath = store.config.iCloudRoot.path
             Task { await store.refreshLLMProvider() }
         }
+    }
+
+    /// Point the app at a different library folder. Creates the standard
+    /// layout first — pointing at an empty folder used to leave the user
+    /// staring at an empty library with the reason buried in a property
+    /// nothing displayed.
+    private func applyRoot() {
+        let url = URL(fileURLWithPath: (rootPath as NSString).expandingTildeInPath)
+        let cfg = AppConfig(iCloudRoot: url)
+        do {
+            try cfg.ensureLayout()
+        } catch {
+            rootStatus = ("Couldn't use that folder: \(error.localizedDescription)", true)
+            return
+        }
+        store.config = cfg
+        cfg.save()
+        rootStatus = ("Library folder set. \(AppConfig.cloudProviderName(for: url) ?? "Not in a synced cloud folder") — \(url.path)", false)
+        Task { await store.rescan() }
     }
 
     private func addWatchedFolder() {

@@ -125,9 +125,19 @@ struct Paper: Codable, Identifiable, Hashable {
     }
 
     var addedDate: Date? {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.date(from: added_at)
+        ISO8601.internetDateTime.date(from: added_at)
+    }
+
+    /// Canonical web links for the paper, built in one place — the list's
+    /// context menu and the detail action row both offer them.
+    var arxivURL: URL? {
+        guard let id = arxiv_id, !id.isEmpty else { return nil }
+        return URL(string: "https://arxiv.org/abs/\(id)")
+    }
+
+    var doiURL: URL? {
+        guard let doi, !doi.isEmpty else { return nil }
+        return URL(string: "https://doi.org/\(doi)")
     }
 
     var authorsShort: String {
@@ -173,12 +183,6 @@ enum SortPreset: String, CaseIterable, Identifiable, Hashable {
         case .titleAZ:                    return "textformat.abc"
         case .titleZA:                    return "textformat.abc.dottedunderline"
         }
-    }
-
-    /// Whether this sort needs LibraryStore.prefs (i.e. can't be expressed as a
-    /// KeyPathComparator over the immutable Paper struct).
-    var needsPrefs: Bool {
-        self == .ratingHighest
     }
 
     var comparators: [KeyPathComparator<Paper>] {

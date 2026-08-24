@@ -46,6 +46,8 @@ existing library and your papers, tags, and ratings show up.
 
 ## Using it
 
+<img src="docs/assets/sift-search.gif" width="760" alt="Sift's reader searches a 215-page PDF: matches highlighted in the page, a 3 of 51 counter in the toolbar, then the same field filters the library list back on the Library tab.">
+
 - **Add:** drag a PDF onto the window, **⌘N** for a file or arXiv link, or drop
   into `<library>/inbox/` and press **⌘R**. Sift can also watch folders (e.g.
   Downloads) and offer to import new PDFs it finds — configure them in Settings.
@@ -54,8 +56,14 @@ existing library and your papers, tags, and ratings show up.
   contents, and — with an AI helper connected — a chat that answers questions
   grounded in the paper, pre-loaded with its summary. Prefer Preview? It's in
   the row's right-click menu.
+- **Search:** one field, top right, same spot on every tab. On Library it
+  filters the list by title, author, tag, or venue. In a reader tab that same
+  field searches the PDF instead: **⌘F** focuses it, **⌘G** and **⇧⌘G** walk
+  the matches, **Esc** clears. Hits stay highlighted while you read, the one
+  you're on in orange, and the counter beside the field says 3 of 51. Long
+  books take a second to scan the first time; it says so while it works.
 - **Organize:** sidebar filters by Library, Kind (papers / books / reports /
-  posters), Folder, Author, and Tag; sort and search the list; rate 1–5; toggle
+  posters), Folder, Author, and Tag; sort the list; rate 1–5; toggle
   read/saved; edit title, kind, and tags inline; **⌫** deletes to Trash. Click
   the **Authors** or **Tags** header to collapse it when those lists get long.
 - **Share:** detail pane and right-click both have a Share action that opens
@@ -94,15 +102,14 @@ disk are the source of truth; there's no separate database.
 
 ## Deliberately simple
 
-Sift stays focused: collect, tag, rate, recall — and, when you sit down to read,
-a built-in reader with highlights and a paper-grounded AI chat, so you don't
-bounce between apps to understand what you saved. It still syncs through your own
-cloud folder rather than running its own, and highlights are written into the PDF
-itself so they travel with the file (and show up in Preview too). It stays a
-catalog first: no accounts, no citation-while-you-write, no server. Citation
-export (BibTeX, RIS, DOI) may arrive later as an optional add-on. A Python
-`paper` CLI for semantic search and static-site export lived here until
-2026-06-01 and is recoverable from git history.
+Sift is a catalog, not a workbench: collect, tag, rate, recall. The reader is
+there so you don't leave the app to read what you saved, and its highlights go
+into the PDF itself, so they travel with the file and open in Preview like any
+other annotation. Sync is whatever cloud folder you already use, not a Sift
+server. There are no accounts, and nothing here writes citations into your
+paper for you. Citation export (BibTeX, RIS, DOI) may show up later as an
+optional add-on. A Python `paper` CLI for semantic search and static-site
+export lived here until 2026-06-01 and is still in git history.
 
 ## License
 

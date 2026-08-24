@@ -64,7 +64,7 @@ final class TagStore: ObservableObject {
                 counts[canon, default: 0] += 1
             }
         }
-        let now = Self.isoNow()
+        let now = ISO8601.now()
         var next: [String: TagEntry] = [:]
         for (name, count) in counts {
             let existing = vocabulary[name]
@@ -88,7 +88,7 @@ final class TagStore: ObservableObject {
     /// Increments counts for tags the paper now has; doesn't decrement old ones
     /// (rebuildFromPapers handles that on next rescan).
     func recordUsage(_ tags: [String]) {
-        let now = Self.isoNow()
+        let now = ISO8601.now()
         for t in tags {
             let name = t.lowercased()
             if var entry = vocabulary[name] {
@@ -181,10 +181,4 @@ final class TagStore: ObservableObject {
     }
 
     // MARK: - Helpers
-
-    private static func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: Date())
-    }
 }

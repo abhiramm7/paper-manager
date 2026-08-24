@@ -109,7 +109,7 @@ struct ImportReviewSheet: View {
             }
             .disabled(!store.llmProvider.isAvailable || isImporting || unassessed == 0)
             .help(!store.llmProvider.isAvailable
-                  ? "No LLM detected. Open Settings to choose Claude or Ollama."
+                  ? LLMTagger.Provider.missingHint
                   : unassessed == 0
                   ? (newFiles.isEmpty ? "No new PDFs to assess." : "All new PDFs are assessed.")
                   : "Read each new PDF with \(store.llmProvider.label) and recommend import or skip")

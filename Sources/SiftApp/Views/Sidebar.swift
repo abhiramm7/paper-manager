@@ -23,8 +23,6 @@ struct Sidebar: View {
     // duplication that ages badly.
     @State private var removeFolderTarget: String? = nil
 
-    private let initialTagCount = 40
-    private let initialAuthorCount = 30
 
     var body: some View {
         listBody
@@ -58,8 +56,8 @@ struct Sidebar: View {
             importSection
             kindSection
             foldersSection
-            authorsSection
-            tagsSection
+            vocabularySection(.authors)
+            vocabularySection(.tags)
         }
     }
 
@@ -183,40 +181,107 @@ struct Sidebar: View {
             }
     }
 
-    @ViewBuilder
-    private var authorsSection: some View {
+    /// Authors and Tags are the same widget over different vocabularies: a
+    /// collapsible header carrying the LLM-consolidate action, a list capped
+    /// until you ask for all of it, and a filter field once it is. Everything
+    /// that actually differs between the two lives in this enum.
+    private enum Vocabulary {
+        case authors, tags
+
+        var title: String { self == .authors ? "Authors" : "Tags" }
+        var icon: String { self == .authors ? "person" : "tag" }
+        /// How many rows before the list stops and offers "Show all".
+        var cap: Int { self == .authors ? 30 : 40 }
+        var filterPrompt: String { self == .authors ? "Filter authors" : "Filter tags" }
+        var emptyHint: String {
+            self == .authors
+                ? "Add some papers to fill this in."
+                : "Tag papers to fill this in."
+        }
+        var consolidateHelp: String {
+            self == .authors
+                ? "Consolidate duplicate author names with the LLM"
+                : "Consolidate near-duplicate tags with the LLM"
+        }
+        /// Tags read as #tag; authors as their plain name.
+        func rowLabel(_ name: String) -> String { self == .authors ? name : "#\(name)" }
+        func libraryFilter(_ name: String) -> LibraryFilter {
+            self == .authors ? .author(name) : .tag(name)
+        }
+    }
+
+    private func entries(_ v: Vocabulary) -> [(name: String, count: Int)] {
+        switch v {
+        case .authors: return store.allAuthors.map { (name: $0.author, count: $0.count) }
+        case .tags:    return store.allTags.map { (name: $0.tag, count: $0.count) }
+        }
+    }
+
+    private func expanded(_ v: Vocabulary) -> Binding<Bool> {
+        v == .authors ? $authorsExpanded : $tagsExpanded
+    }
+
+    private func showAll(_ v: Vocabulary) -> Binding<Bool> {
+        v == .authors ? $showAllAuthors : $showAllTags
+    }
+
+    private func search(_ v: Vocabulary) -> Binding<String> {
+        v == .authors ? $authorSearch : $tagSearch
+    }
+
+    private func consolidating(_ v: Vocabulary) -> Binding<Bool> {
+        v == .authors ? $showConsolidateAuthors : $showConsolidateTags
+    }
+
+    /// The rows actually shown: capped until "Show all", then narrowed by
+    /// whatever is typed in the filter field.
+    private func visibleEntries(_ v: Vocabulary) -> [(name: String, count: Int)] {
+        let all = entries(v)
+        let scoped = showAll(v).wrappedValue ? all : Array(all.prefix(v.cap))
+        let q = search(v).wrappedValue.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return scoped }
+        return scoped.filter { $0.name.lowercased().contains(q) }
+    }
+
+    private func vocabularySection(_ v: Vocabulary) -> some View {
         Section {
-            if authorsExpanded {
-                authorsBody
+            if expanded(v).wrappedValue {
+                vocabularyBody(v)
             }
         } header: {
             collapsibleHeader(
-                title: "Authors",
-                count: store.allAuthors.count,
-                isExpanded: $authorsExpanded,
-                trailing: { authorsHeaderTrailing })
+                title: v.title,
+                count: entries(v).count,
+                isExpanded: expanded(v),
+                trailing: { vocabularyHeaderTrailing(v) })
         }
     }
 
     @ViewBuilder
-    private var authorsBody: some View {
-        if showAllAuthors {
-            TextField("Filter authors", text: $authorSearch)
+    private func vocabularyBody(_ v: Vocabulary) -> some View {
+        let all = entries(v)
+        if showAll(v).wrappedValue {
+            TextField(v.filterPrompt, text: search(v))
                 .textFieldStyle(.roundedBorder)
                 .padding(.vertical, 2)
         }
-        if store.allAuthors.isEmpty {
-            Text("Add some papers to fill this in.")
+        if all.isEmpty {
+            Text(v.emptyHint)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .padding(.vertical, 2)
         } else {
-            ForEach(filteredAuthors, id: \.author) { entry in
-                authorRow(entry)
+            // No per-entry context menu: consolidation is library-wide, not
+            // scoped to the clicked name. The header icon is the honest
+            // affordance for it.
+            ForEach(visibleEntries(v), id: \.name) { entry in
+                Label(v.rowLabel(entry.name), systemImage: v.icon)
+                    .badge(entry.count)
+                    .tag(v.libraryFilter(entry.name))
             }
-            if !showAllAuthors, store.allAuthors.count > initialAuthorCount {
-                Button("Show all \(store.allAuthors.count) authors…") {
-                    showAllAuthors = true
+            if !showAll(v).wrappedValue, all.count > v.cap {
+                Button("Show all \(all.count) \(v.title.lowercased())…") {
+                    showAll(v).wrappedValue = true
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
@@ -226,107 +291,23 @@ struct Sidebar: View {
     }
 
     @ViewBuilder
-    private func authorRow(_ entry: (author: String, count: Int)) -> some View {
-        Label(entry.author, systemImage: "person")
-            .badge(entry.count)
-            .tag(LibraryFilter.author(entry.author))
-        // No per-entry context menu: "Consolidate authors…" is library-wide,
-        // not scoped to the clicked name. The section-header icon is the
-        // honest affordance for it.
-    }
-
-    @ViewBuilder
-    private var authorsHeaderTrailing: some View {
-        if authorsExpanded && showAllAuthors {
-            Button("Show top \(initialAuthorCount)") {
-                showAllAuthors = false
-                authorSearch = ""
+    private func vocabularyHeaderTrailing(_ v: Vocabulary) -> some View {
+        if expanded(v).wrappedValue && showAll(v).wrappedValue {
+            Button("Show top \(v.cap)") {
+                showAll(v).wrappedValue = false
+                search(v).wrappedValue = ""
             }
             .buttonStyle(.borderless)
             .font(.caption)
         }
         Button {
-            showConsolidateAuthors = true
+            consolidating(v).wrappedValue = true
         } label: {
             Image(systemName: "sparkles")
         }
         .buttonStyle(.borderless)
-        .disabled(!store.llmProvider.isAvailable || store.allAuthors.count < 4)
-        .help(store.llmProvider.isAvailable
-              ? "Consolidate duplicate author names with the LLM"
-              : "Install Claude Code or Ollama to use this — Settings → Auto-tagging shows the setup hint.")
-    }
-
-    @ViewBuilder
-    private var tagsSection: some View {
-        Section {
-            if tagsExpanded {
-                tagsBody
-            }
-        } header: {
-            collapsibleHeader(
-                title: "Tags",
-                count: store.allTags.count,
-                isExpanded: $tagsExpanded,
-                trailing: { tagsHeaderTrailing })
-        }
-    }
-
-    @ViewBuilder
-    private var tagsBody: some View {
-        if showAllTags {
-            TextField("Filter tags", text: $tagSearch)
-                .textFieldStyle(.roundedBorder)
-                .padding(.vertical, 2)
-        }
-        if store.allTags.isEmpty {
-            Text("Tag papers to fill this in.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .padding(.vertical, 2)
-        } else {
-            ForEach(filteredTags, id: \.tag) { entry in
-                tagRow(entry)
-            }
-            if !showAllTags, store.allTags.count > initialTagCount {
-                Button("Show all \(store.allTags.count) tags…") {
-                    showAllTags = true
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
-                .font(.caption)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func tagRow(_ entry: (tag: String, count: Int)) -> some View {
-        Label("#\(entry.tag)", systemImage: "tag")
-            .badge(entry.count)
-            .tag(LibraryFilter.tag(entry.tag))
-        // Same reasoning as authorRow: "Consolidate tags…" is library-wide.
-    }
-
-    @ViewBuilder
-    private var tagsHeaderTrailing: some View {
-        if tagsExpanded && showAllTags {
-            Button("Show top \(initialTagCount)") {
-                showAllTags = false
-                tagSearch = ""
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-        }
-        Button {
-            showConsolidateTags = true
-        } label: {
-            Image(systemName: "sparkles")
-        }
-        .buttonStyle(.borderless)
-        .disabled(!store.llmProvider.isAvailable || store.allTags.count < 4)
-        .help(store.llmProvider.isAvailable
-              ? "Consolidate near-duplicate tags with the LLM"
-              : "Install Claude Code or Ollama to use this — Settings → Auto-tagging shows the setup hint.")
+        .disabled(!store.llmProvider.isAvailable || entries(v).count < 4)
+        .help(store.llmProvider.isAvailable ? v.consolidateHelp : LLMTagger.Provider.missingHint)
     }
 
     // MARK: - Alerts
@@ -407,24 +388,6 @@ struct Sidebar: View {
             .buttonStyle(.plain)
             trailing()
         }
-    }
-
-    // MARK: - Filtered lists
-
-    private var filteredAuthors: [(author: String, count: Int)] {
-        let all = store.allAuthors
-        let scoped = showAllAuthors ? all : Array(all.prefix(initialAuthorCount))
-        let q = authorSearch.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return scoped }
-        return scoped.filter { $0.author.lowercased().contains(q) }
-    }
-
-    private var filteredTags: [(tag: String, count: Int)] {
-        let all = store.allTags
-        let scoped = showAllTags ? all : Array(all.prefix(initialTagCount))
-        let q = tagSearch.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return scoped }
-        return scoped.filter { $0.tag.lowercased().contains(q) }
     }
 
     private var unreadCount: Int {

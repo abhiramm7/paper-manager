@@ -107,20 +107,18 @@ final class IngestService {
         let tmp = try await downloadToTemp(url)
         defer { try? FileManager.default.removeItem(at: tmp) }
 
-        var result = try await addLocalPDF(at: tmp, tags: tags)
+        let result = try await addLocalPDF(at: tmp, tags: tags)
         if let arxivID = id {
             try updateMetadata(paperId: result.paperId) { meta in
                 meta["arxiv_id"] = arxivID
                 meta["source"] = "arxiv"
             }
-        }
-        // Force the source field even if we didn't have an arXiv id.
-        if id == nil {
+        } else {
+            // Direct PDF URL — record where it came from.
             try updateMetadata(paperId: result.paperId) { meta in
                 meta["source"] = "url"
             }
         }
-        result = IngestResult(paperId: result.paperId, alreadyExisted: result.alreadyExisted)
         return result
     }
 
@@ -140,7 +138,7 @@ final class IngestService {
             "venue": venue as Any? ?? NSNull(),
             "doi": doi as Any? ?? NSNull(),
             "arxiv_id": arxivID as Any? ?? NSNull(),
-            "added_at": Self.isoNow(),
+            "added_at": ISO8601.now(),
             "sha256": sha256,
             "source": source,
             "kind": kind.rawValue,
@@ -154,7 +152,14 @@ final class IngestService {
         if let existing = try? Data(contentsOf: url),
            let parsed = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] {
             if let existingTags = parsed["user_tags"] as? [String], !existingTags.isEmpty {
-                meta["user_tags"] = existingTags
+                // Union, not replace: re-adding a known PDF with new tags used
+                // to silently drop them.
+                var merged = existingTags
+                var seen = Set(existingTags.map { $0.lowercased() })
+                for t in userTags where seen.insert(t.lowercased()).inserted {
+                    merged.append(t)
+                }
+                meta["user_tags"] = merged
             }
             if let existingAddedAt = parsed["added_at"] as? String, !existingAddedAt.isEmpty {
                 meta["added_at"] = existingAddedAt
@@ -210,12 +215,6 @@ final class IngestService {
             hasher.update(data: chunk)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    static func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: Date())
     }
 
     /// "Smith, John; Doe, Jane" or "John Smith and Jane Doe" → ["John Smith", "Jane Doe"]

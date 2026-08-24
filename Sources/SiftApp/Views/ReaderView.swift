@@ -18,6 +18,69 @@ final class PDFViewProxy: ObservableObject {
     /// highlight count) need this published signal to recompute after load —
     /// without it the TOC/Highlights buttons stay disabled forever.
     @Published var documentVersion = 0
+
+    // MARK: - Find in PDF
+
+    /// Every hit for the current query, and whether a search is still running.
+    /// The scan itself goes through PDFKit's *async* find: the first search
+    /// over a long book has to lay out every page (3.5s on a 215-page one),
+    /// and doing that inline froze the reader mid-keystroke.
+    private(set) var findMatches: [PDFSelection] = []
+    @Published private(set) var isFinding = false
+    /// Bumped whenever `findMatches` is replaced, so the reader can react
+    /// without diffing an array of selections.
+    @Published private(set) var findVersion = 0
+
+    private var findObservers: [NSObjectProtocol] = []
+    private var foundSoFar: [PDFSelection] = []
+
+    /// Start (or restart) a search. Results land in `findMatches` when the
+    /// scan finishes; `isFinding` is true until then.
+    func startFind(_ query: String) {
+        cancelFind()
+        guard let doc = pdfView?.document, !query.isEmpty else {
+            replaceMatches(with: [])
+            return
+        }
+        foundSoFar = []
+        isFinding = true
+        let center = NotificationCenter.default
+        findObservers = [
+            center.addObserver(
+                forName: .PDFDocumentDidFindMatch, object: doc, queue: .main
+            ) { [weak self] note in
+                guard let sel = note.userInfo?["PDFDocumentFoundSelection"] as? PDFSelection
+                else { return }
+                self?.foundSoFar.append(sel)
+            },
+            center.addObserver(
+                forName: .PDFDocumentDidEndFind, object: doc, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.stopObservingFind()
+                self.isFinding = false
+                self.replaceMatches(with: self.foundSoFar)
+            },
+        ]
+        doc.beginFindString(query, withOptions: [.caseInsensitive, .diacriticInsensitive])
+    }
+
+    /// Stop any running search. Safe to call when none is.
+    func cancelFind() {
+        stopObservingFind()   // before cancelling: the cancel posts DidEndFind
+        pdfView?.document?.cancelFindString()
+        isFinding = false
+    }
+
+    private func replaceMatches(with matches: [PDFSelection]) {
+        findMatches = matches
+        findVersion += 1
+    }
+
+    private func stopObservingFind() {
+        findObservers.forEach(NotificationCenter.default.removeObserver)
+        findObservers = []
+    }
 }
 
 /// Reader tab: the paper's PDF (with highlighting) alongside an LLM chat
@@ -30,6 +93,11 @@ struct ReaderView: View {
     @StateObject private var proxy = PDFViewProxy()
     @State private var showHighlights = false
     @State private var showTOC = false
+    /// Which hit we're on (1-based, 0 = none). The hits themselves live on
+    /// the proxy, which runs the search; the query lives in the store,
+    /// because the field driving it is in the window toolbar.
+    @State private var matchIndex: Int = 0
+    @State private var findTask: Task<Void, Never>?
 
     private var paper: Paper? { store.papers.first(where: { $0.id == paperId }) }
 
@@ -46,12 +114,109 @@ struct ReaderView: View {
                 ReaderChatPanel(paper: paper)
                     .frame(minWidth: 300, idealWidth: 380, maxWidth: 560, maxHeight: .infinity)
             }
+            .onChange(of: store.findQuery[paperId] ?? "") { _, query in
+                scheduleFind(query)
+            }
+            // The document loads after the view appears, so a query typed
+            // (or restored) before then has nothing to search yet.
+            .onChange(of: proxy.documentVersion) { _, _ in
+                runFind(store.findQuery[paperId] ?? "")
+            }
+            // Search finished: land on the first hit and tell the toolbar.
+            .onChange(of: proxy.findVersion) { _, _ in
+                matchIndex = proxy.findMatches.isEmpty ? 0 : 1
+                applyMatchColors()
+                publishFindStatus()
+                scrollToCurrentMatch()
+            }
+            .onChange(of: proxy.isFinding) { _, _ in
+                publishFindStatus()
+            }
+            // Every open tab's ReaderView stays alive in the ZStack, so only
+            // the frontmost one may answer ⌘G.
+            .onReceive(NotificationCenter.default.publisher(for: .findNext)) { _ in
+                step(1)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .findPrevious)) { _ in
+                step(-1)
+            }
         } else {
             ContentUnavailableView(
                 "Paper not found",
                 systemImage: "questionmark.folder",
                 description: Text("It may have been deleted from the library."))
         }
+    }
+
+    // MARK: - Find in PDF
+
+    /// Typing outruns PDFKit — wait for a pause before scanning the document.
+    private func scheduleFind(_ query: String) {
+        findTask?.cancel()
+        findTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            runFind(query)
+        }
+    }
+
+    /// Hand the query to the proxy, which runs PDFKit's async find and calls
+    /// back through `findVersion`. Anything shorter than the minimum just
+    /// clears — a one-character find lights up half the document.
+    private func runFind(_ rawQuery: String) {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= LibraryStore.minFindLength else {
+            clearFind()
+            return
+        }
+        proxy.startFind(query)
+        publishFindStatus()   // "Searching…" until the scan reports back
+    }
+
+    private func step(_ delta: Int) {
+        let n = proxy.findMatches.count
+        guard store.activeReaderTab == paperId, n > 0 else { return }
+        // Wrap around: past the last match is the first one again.
+        matchIndex = (((matchIndex - 1 + delta) % n) + n) % n + 1
+        applyMatchColors()
+        publishFindStatus()
+        scrollToCurrentMatch()
+    }
+
+    private func clearFind() {
+        findTask?.cancel()
+        proxy.cancelFind()
+        matchIndex = 0
+        proxy.pdfView?.highlightedSelections = nil
+        publishFindStatus()
+    }
+
+    /// All hits in yellow, the current one in orange — the same read as
+    /// Preview's find, so the eye can tell "here" from "also here".
+    private func applyMatchColors() {
+        let matches = proxy.findMatches
+        for (i, sel) in matches.enumerated() {
+            sel.color = (i == matchIndex - 1) ? .systemOrange : .systemYellow
+        }
+        proxy.pdfView?.highlightedSelections = matches.isEmpty ? nil : matches
+    }
+
+    private func scrollToCurrentMatch() {
+        let matches = proxy.findMatches
+        guard matches.indices.contains(matchIndex - 1),
+              let page = matches[matchIndex - 1].pages.first else { return }
+        // Scroll the hit into view with some room around it. Deliberately not
+        // `setCurrentSelection` — that would count as a text selection and arm
+        // the Highlight control behind the user's back.
+        let box = matches[matchIndex - 1].bounds(for: page).insetBy(dx: -40, dy: -80)
+        proxy.pdfView?.go(to: box, on: page)
+    }
+
+    private func publishFindStatus() {
+        store.findStatus[paperId] = .init(
+            count: proxy.findMatches.count,
+            index: matchIndex,
+            searching: proxy.isFinding)
     }
 
     // MARK: - Reader bar (title + highlight controls)
@@ -326,12 +491,29 @@ struct ReaderView: View {
     /// Write annotations into paper.pdf itself. The iCloud file is canonical,
     /// so highlights sync with the library and show up in Preview and any
     /// other PDF reader too.
+    ///
+    /// Never `doc.write(to:)` straight at the open document's own URL: PDFKit
+    /// parses pages lazily out of that file, so truncating and rewriting it
+    /// underneath a live PDFDocument risks corrupting the one canonical copy
+    /// of the paper. Serialize to memory here (PDFDocument isn't thread-safe),
+    /// then let an atomic write — temp file plus rename — land the bytes off
+    /// the main thread so a big book doesn't freeze the reader.
     private func persist(_ doc: PDFDocument) {
         let url = store.config.pdfURL(paperId)
-        if !doc.write(to: url) {
+        guard let data = doc.dataRepresentation() else {
             store.showToast("Couldn't save highlights to the PDF.")
+            return
         }
         proxy.annotationsVersion += 1
+        Task { @MainActor in
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try data.write(to: url, options: .atomic)
+                }.value
+            } catch {
+                store.showToast("Couldn't save highlights: \(error.localizedDescription)")
+            }
+        }
     }
 }
 
@@ -463,7 +645,7 @@ struct ReaderChatPanel: View {
             Text("Ask anything about this paper — answers are grounded in the PDF's text.")
             Text("Try: \"What problem does this solve?\" · \"Summarize the method\" · \"What are the limitations?\"")
             if !store.llmProvider.isAvailable {
-                Label("No LLM detected — configure one in Settings → Auto-tagging.",
+                Label(LLMTagger.Provider.missingHint,
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }

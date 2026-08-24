@@ -10,7 +10,9 @@ struct PaperList: View {
     @State private var pendingDeleteID: String?
 
     var body: some View {
-        Table(of: Paper.self, selection: $selectedID, sortOrder: $sortOrder) {
+        // One sort + one partition per pass, shared by both table sections.
+        let groups = partitioned
+        return Table(of: Paper.self, selection: $selectedID, sortOrder: $sortOrder) {
             TableColumn("") { p in
                 let saved = store.prefs(for: p.id).saved
                 Image(systemName: saved ? "bookmark.fill" : "bookmark")
@@ -33,6 +35,11 @@ struct PaperList: View {
                     Text(p.title)
                         .font(.body)
                         .lineLimit(2)
+                        // A sectioned Table sizes every row from the first
+                        // one it measures, so a variable-height title cell
+                        // makes later two-line rows overlap. Pin the height
+                        // to exactly two lines and the grid stays honest.
+                        .frame(height: 34, alignment: .leading)
                     // While the LLM is filling in this paper, show a spinner +
                     // "tagging…" so a freshly-added row (still showing its
                     // filename as the title) doesn't look broken or stuck.
@@ -99,8 +106,19 @@ struct PaperList: View {
             }
             .width(min: 32, ideal: 36, max: 50)
         } rows: {
-            ForEach(sorted) { p in
-                TableRow(p)
+            // Pinned-at-top "Currently reading", like pinned mail. The papers
+            // are pulled out of the main flow rather than duplicated, and both
+            // groups stay inside whatever filter/search is active — a pinned
+            // paper that doesn't match what you're looking at would be noise.
+            if groups.reading.isEmpty {
+                ForEach(groups.rest) { TableRow($0) }
+            } else {
+                Section("Currently reading") {
+                    ForEach(groups.reading) { TableRow($0) }
+                }
+                Section(restSectionTitle) {
+                    ForEach(groups.rest) { TableRow($0) }
+                }
             }
         }
         .contextMenu(forSelectionType: String.self) { ids in
@@ -114,7 +132,6 @@ struct PaperList: View {
                 store.openReader(for: id)
             }
         }
-        .searchable(text: $searchText, placement: .toolbar, prompt: "Search title, authors, tags")
         .overlay {
             if papers.isEmpty {
                 ContentUnavailableView(
@@ -151,11 +168,14 @@ struct PaperList: View {
     }
 
     /// Pick the next selection target after deleting `id`: prefer the row below,
-    /// fall back to the one above, then nil.
+    /// fall back to the one above, then nil. Walks the *displayed* order — the
+    /// pinned section first — so selection lands where the eye expects.
     private func neighbor(of id: String) -> String? {
-        guard let i = sorted.firstIndex(where: { $0.id == id }) else { return nil }
-        if i + 1 < sorted.count { return sorted[i + 1].id }
-        if i - 1 >= 0 { return sorted[i - 1].id }
+        let groups = partitioned
+        let displayed = groups.reading + groups.rest
+        guard let i = displayed.firstIndex(where: { $0.id == id }) else { return nil }
+        if i + 1 < displayed.count { return displayed[i + 1].id }
+        if i - 1 >= 0 { return displayed[i - 1].id }
         return nil
     }
 
@@ -170,6 +190,23 @@ struct PaperList: View {
             if lr != rr { return lr > rr }
             return (lhs.addedDate ?? .distantPast) > (rhs.addedDate ?? .distantPast)
         }
+    }
+
+    /// `sorted`, split into the pinned group and everything else. Computed
+    /// once per body pass — the Table's two sections both read it.
+    private var partitioned: (reading: [Paper], rest: [Paper]) {
+        var reading: [Paper] = []
+        var rest: [Paper] = []
+        for p in sorted {
+            if store.prefs(for: p.id).reading { reading.append(p) } else { rest.append(p) }
+        }
+        return (reading, rest)
+    }
+
+    /// The second section's header. Named for the active view so the split
+    /// reads as "these are pinned, those are the rest of what you're seeing".
+    private var restSectionTitle: String {
+        searchText.isEmpty ? "Library" : "Search results"
     }
 
     private var emptyMessage: String {
@@ -199,6 +236,9 @@ struct PaperList: View {
         Button("Reveal in Finder") { store.revealInFinder(p) }
         ShareLink("Share…", item: store.config.pdfURL(p.id))
         Divider()
+        Button(prefs.reading ? "Remove from Currently Reading" : "Add to Currently Reading") {
+            store.setReading(!prefs.reading, for: p.id)
+        }
         Button(prefs.read ? "Mark as Unread" : "Mark as Read") {
             store.setRead(!prefs.read, for: p.id)
         }
@@ -228,19 +268,11 @@ struct PaperList: View {
             }
         }
         Divider()
-        if let arxiv = p.arxiv_id, !arxiv.isEmpty {
-            Button("Open arXiv page") {
-                if let url = URL(string: "https://arxiv.org/abs/\(arxiv)") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+        if let url = p.arxivURL {
+            Button("Open arXiv page") { NSWorkspace.shared.open(url) }
         }
-        if let doi = p.doi, !doi.isEmpty {
-            Button("Open DOI") {
-                if let url = URL(string: "https://doi.org/\(doi)") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+        if let url = p.doiURL {
+            Button("Open DOI") { NSWorkspace.shared.open(url) }
         }
         Divider()
         Button("Move to Trash…", role: .destructive) {

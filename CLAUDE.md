@@ -89,6 +89,29 @@ no separate database to migrate.
   management, author consolidation, and tag consolidation are reachable
   only from the sidebar — section-header icons and per-entry right-click.
   Settings shows counts and configuration knobs; no operation buttons.
+- **Safari-shaped chrome.** The tab strip (Library + one tab per open PDF)
+  is a `ToolbarItem(placement: .navigation)`, so it renders beside the
+  window's own close/minimize/zoom buttons. The title text is suppressed via
+  `WindowAccessor` setting `titleVisibility = .hidden` — never
+  `.navigationTitle("")`, which renames the window itself. Library-only
+  toolbar items are gated on `isLibraryActive`; a reader tab shows just the
+  tabs. ⌘W closes the active reader tab, or the window when on Library.
+- **One search field, fixed at the top right.** `ToolbarSearchField` (an
+  `NSSearchField`) is a plain toolbar item preceded by a flexible-space
+  `ToolbarItem { Spacer() }`, so it holds the trailing edge on every tab —
+  `.searchable(placement: .toolbar)` drifted left against the tab strip once
+  the library tools were gated out. What it searches follows the tab: the
+  library filter on Library, find-in-PDF in a reader (`store.findQuery` /
+  `findStatus`, keyed by paper id; ⌘F focuses, ⌘G / ⇧⌘G / ↩ step matches,
+  Esc clears). `PDFViewProxy` runs the scan through PDFKit's *async*
+  `beginFindString` — the synchronous `findString` blocks for seconds on the
+  first search over a book, which froze the reader mid-keystroke.
+- **`prefs.reading` pins a paper** to the "Currently reading" section at the
+  top of the table. Set when the reader opens a paper, cleared by marking it
+  read; `read` and `reading` are mutually exclusive. `PaperList` partitions
+  the already-filtered list into two `Table` sections — a sectioned `Table`
+  sizes all rows from the first one it measures, which is why the title cell
+  carries a fixed height.
 
 ## LLM operations
 

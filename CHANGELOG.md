@@ -12,6 +12,25 @@ including patches see [GitHub Releases](https://github.com/abhiramm7/sift/releas
   contents from the PDF outline, and — with an AI helper connected — a chat
   that answers questions grounded in the paper, pre-loaded with its summary.
   Readers open as in-window tabs; Preview moved to the row's right-click menu.
+- **Find in the PDF** (0.6.1). One search field lives at the top right of the
+  window and stays there on every tab. On Library it filters the paper list;
+  in a reader tab it searches the open PDF instead — ⌘F focuses it, ⌘G and
+  ⇧⌘G walk the matches, Esc clears. Hits stay highlighted while you read, the
+  current one in orange, with a "3 of 51" counter beside the field. The scan
+  runs off the main thread, so a 200-page book doesn't freeze the reader.
+- **Tabs beside the traffic lights.** The tab strip moved into the window
+  toolbar, Safari-style: Library first, then one tab per open PDF. ⌘W closes
+  the tab you're on and falls through to closing the window on Library.
+- **Currently reading.** Opening a paper in the reader pins it to a section at
+  the top of the list; marking it read unpins it. Toggle it by hand from the
+  detail pane or the row's right-click menu. Stored as a new `reading` key in
+  prefs.json, which older libraries gain on their next write.
+- **Faster watched-folder rescans.** Scans remember each file's hash against
+  its size and modification date, so a rescan only re-hashes PDFs that
+  actually changed instead of every byte in every watched folder.
+- **Settings says what happened** when you point Sift at a library folder: it
+  creates the layout, then reports the folder and whether it's in a synced
+  cloud folder, or why it couldn't use it.
 - **Watched folders.** Point Sift at folders (e.g. Downloads) in Settings; it
   scans on launch and offers to import new PDFs it finds, de-duplicated
   against the library by content hash. Duplicates can be moved to the Trash.
@@ -27,6 +46,9 @@ including patches see [GitHub Releases](https://github.com/abhiramm7/sift/releas
 - **Toggleable detail panel** (⌥⌘0) and a consolidated **AI** toolbar menu.
 - **Internals.** All LLM calls funnel through one dispatch + JSON-parse +
   provider-resolution + bulk-runner path (see CLAUDE.md → LLM operations).
+  0.6.1 does the same for the duplicated view and store code: one prefs
+  writer, one metadata.json writer, one merge parser, one timestamp helper,
+  and a single sidebar section shared by Authors and Tags.
 
 ## 0.5 — Library maintenance
 
