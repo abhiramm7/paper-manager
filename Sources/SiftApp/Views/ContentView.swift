@@ -20,7 +20,6 @@ struct ContentView: View {
     @State private var showAdd: Bool = false
     @State private var sortPreset: SortPreset = .recent
     @State private var sortOrder: [KeyPathComparator<Paper>] = SortPreset.recent.comparators
-    @State private var dropStatus: String?
     // Detail panel visibility — persisted so the layout survives relaunch.
     @AppStorage("Sift.detailPaneVisible") private var showDetailPane: Bool = true
     @State private var showImportReview: Bool = false
@@ -121,7 +120,7 @@ struct ContentView: View {
             handleDroppedFiles(providers)
         }
         .overlay(alignment: .bottom) {
-            if let s = dropStatus ?? store.statusToast {
+            if let s = store.statusToast {
                 Text(s)
                     .font(.callout)
                     .padding(.horizontal, 14)
@@ -578,25 +577,11 @@ struct ContentView: View {
             if !result.alreadyExisted {
                 store.generateTagsInBackground(for: result.paperId)
             }
-            showStatus(result.alreadyExisted
+            store.showToast(result.alreadyExisted
                 ? "Already in library: \(url.lastPathComponent)"
                 : "Added \(url.lastPathComponent)")
         } catch {
-            showStatus("Failed: \(error.localizedDescription)")
-        }
-    }
-
-    private func showStatus(_ message: String) {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            dropStatus = message
-        }
-        Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            await MainActor.run {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    if dropStatus == message { dropStatus = nil }
-                }
-            }
+            store.showToast("Failed: \(error.localizedDescription)")
         }
     }
 

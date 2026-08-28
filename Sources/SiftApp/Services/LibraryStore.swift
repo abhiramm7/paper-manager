@@ -285,6 +285,18 @@ final class LibraryStore: ObservableObject {
         prefs[id] ?? PrefsEntry()
     }
 
+    /// Point the app at a different library root: create the standard layout,
+    /// swap the config (which re-points the tag store), persist the choice,
+    /// and rescan. The one path for changing libraries — Settings and
+    /// first-run onboarding both go through here.
+    func setLibraryRoot(_ url: URL) throws {
+        let cfg = AppConfig(iCloudRoot: url)
+        try cfg.ensureLayout()
+        config = cfg
+        cfg.save()
+        Task { await rescan() }
+    }
+
     // MARK: - Watched-folder scanning
 
     /// Scan every watched folder for PDFs and match them against the library

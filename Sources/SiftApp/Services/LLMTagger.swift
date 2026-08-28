@@ -561,17 +561,10 @@ enum LLMTagger {
                 }
             }
         }
-        // Most-voted candidate wins, ties broken by key so the result doesn't
-        // depend on dictionary iteration order.
-        func titleWinner() -> String? {
-            titleVotes
-                .filter { $0.value.count >= 2 }
-                .max { a, b in
-                    a.value.count != b.value.count ? a.value.count < b.value.count : a.key > b.key
-                }?.value.display
-        }
-        func authorsWinner() -> [String]? {
-            authorVotes
+        // A value wins with 2+ agreeing votes; ties break by key so the result
+        // doesn't depend on dictionary iteration order.
+        func winner<Value>(_ votes: [String: (count: Int, display: Value)]) -> Value? {
+            votes
                 .filter { $0.value.count >= 2 }
                 .max { a, b in
                     a.value.count != b.value.count ? a.value.count < b.value.count : a.key > b.key
@@ -580,13 +573,13 @@ enum LLMTagger {
 
         addVote(seed)
         for _ in 0..<max(maxExtraPasses, 0) {
-            if titleWinner() != nil, authorsWinner() != nil { break }
+            if winner(titleVotes) != nil, winner(authorVotes) != nil { break }
             guard let pass = try? await extractTitleAuthors(text: text, using: provider) else {
                 continue
             }
             addVote(pass)
         }
-        return TitleAuthorsProposal(title: titleWinner(), authors: authorsWinner())
+        return TitleAuthorsProposal(title: winner(titleVotes), authors: winner(authorVotes))
     }
 
     /// Normalized comparison key for title votes — case/whitespace/trailing-
@@ -657,11 +650,7 @@ enum LLMTagger {
             guard shouldImport, let raw = obj["kind"] as? String else { return nil }
             return PaperKind(rawValue: raw.lowercased().trimmingCharacters(in: .whitespaces))
         }()
-        let title: String? = {
-            guard let t = obj["title"] as? String else { return nil }
-            let cleaned = t.trimmingCharacters(in: .whitespacesAndNewlines)
-            return cleaned.isEmpty ? nil : cleaned
-        }()
+        let title = nonEmptyString(obj["title"])
         let reason = ((obj["reason"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return ImportAssessment(shouldImport: shouldImport, kind: kind,
@@ -932,6 +921,12 @@ enum LLMTagger {
     ) throws -> String {
         let proc = Process()
         proc.executableURL = bin
+        // The CLI treats its working directory as a project root and scans it
+        // for context. Inheriting Sift's cwd — "/" when launched from Finder,
+        // or an arbitrary folder when launched from a shell — sends those
+        // scans into TCC-protected folders, and macOS bills the permission
+        // prompts to Sift. Pin it somewhere neutral the app already owns.
+        proc.currentDirectoryURL = FileManager.default.temporaryDirectory
         var args = ["-p", "--no-session-persistence"]
         if let m = model, !m.isEmpty {
             args.append(contentsOf: ["--model", m])
@@ -1050,11 +1045,7 @@ enum LLMTagger {
             return ExtractedInfo(title: nil, summary: nil, topics: [], applicationAreas: [], methods: [])
         }
 
-        let title: String? = {
-            guard let t = obj["title"] as? String else { return nil }
-            let cleaned = t.trimmingCharacters(in: .whitespacesAndNewlines)
-            return cleaned.isEmpty ? nil : cleaned
-        }()
+        let title = nonEmptyString(obj["title"])
         let authors: [String]? = {
             // Accept either ["A","B"] (preferred) or "A, B" (LLM goof).
             var raw: [String] = stringArray(from: obj["authors"])
@@ -1070,11 +1061,7 @@ enum LLMTagger {
             let cleaned = cleanAuthorList(sized)
             return cleaned.isEmpty ? nil : Array(cleaned.prefix(20))
         }()
-        let summary: String? = {
-            guard let s = obj["summary"] as? String else { return nil }
-            let cleaned = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return cleaned.isEmpty ? nil : cleaned
-        }()
+        let summary = nonEmptyString(obj["summary"])
         let topics = stringArray(from: obj["topics"])
         let apps = stringArray(from: obj["application_areas"] ?? obj["applications"] ?? obj["application areas"])
         let methods = stringArray(from: obj["methods"])
@@ -1277,6 +1264,13 @@ enum LLMTagger {
     private static func stringArray(from any: Any?) -> [String] {
         guard let arr = any as? [Any] else { return [] }
         return arr.compactMap { $0 as? String }
+    }
+
+    /// Trimmed string from a JSON value, or nil when absent or empty.
+    private static func nonEmptyString(_ any: Any?) -> String? {
+        guard let s = any as? String else { return nil }
+        let cleaned = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     static func normalize(_ tags: [String], max: Int) -> [String] {

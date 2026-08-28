@@ -175,16 +175,6 @@ enum SortPreset: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
-    var symbol: String {
-        switch self {
-        case .recent, .yearNewest:        return "arrow.down"
-        case .oldest, .yearOldest:        return "arrow.up"
-        case .ratingHighest:              return "star.fill"
-        case .titleAZ:                    return "textformat.abc"
-        case .titleZA:                    return "textformat.abc.dottedunderline"
-        }
-    }
-
     var comparators: [KeyPathComparator<Paper>] {
         switch self {
         case .recent:        return [KeyPathComparator(\Paper.addedSort, order: .reverse)]

@@ -44,8 +44,18 @@ cp Resources/Info.plist "$APP_DIR/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
 printf "APPL????" > "$APP_DIR/Contents/PkgInfo"
 
-echo "==> codesign --force --deep --sign -"
-codesign --force --deep --sign - "$APP_DIR" >/dev/null
+# Sign with a stable identity when one exists. macOS keys folder-access
+# grants (Downloads, Documents, iCloud Drive, …) to the app's code signature,
+# and an ad-hoc signature changes with every build — so each rebuild would
+# re-trigger every permission prompt. Override with SIFT_SIGN_ID if needed.
+SIGN_ID="${SIFT_SIGN_ID:-$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Apple Development/ {print $2; exit}')}"
+if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID="-"
+    echo "warn: no signing identity found — signing ad-hoc (folder permission prompts will repeat after every rebuild)" >&2
+fi
+echo "==> codesign --force --sign \"$SIGN_ID\""
+codesign --force --deep --sign "$SIGN_ID" "$APP_DIR" >/dev/null
 
 echo "==> done: $APP_DIR"
 
@@ -67,7 +77,7 @@ Sift $VERSION
 To install:
   1. Drag Sift.app into the Applications folder (shown next to it).
   2. The first time you launch it, macOS Gatekeeper will block it because
-     this build is signed ad-hoc (not notarized by Apple).
+     this build isn't notarized by Apple.
      To open it anyway:
         Right-click Sift.app → Open → Open
      You'll only need to do this once.

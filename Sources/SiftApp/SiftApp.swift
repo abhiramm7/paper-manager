@@ -1,7 +1,18 @@
 import SwiftUI
+import AppKit
+
+/// Sift is a single-window app: closing that window means "I'm done", so the
+/// app quits instead of lingering as a windowless Dock icon (SwiftUI's
+/// document-app default).
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+}
 
 @main
 struct SiftApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = LibraryStore()
 
     var body: some Scene {

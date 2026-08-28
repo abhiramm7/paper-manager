@@ -137,18 +137,14 @@ struct WelcomeView: View {
 
     private func commit() {
         let url = URL(fileURLWithPath: (chosenPath as NSString).expandingTildeInPath)
-        let cfg = AppConfig(iCloudRoot: url)
         do {
-            try cfg.ensureLayout()
+            try store.setLibraryRoot(url)
         } catch {
             statusMessage = "Could not create folder: \(error.localizedDescription)"
             statusIsError = true
             return
         }
-        cfg.save()
         UserDefaults.standard.set(true, forKey: AppConfig.onboardingDoneKey)
-        store.config = cfg
         isPresented = false
-        Task { await store.rescan() }
     }
 }

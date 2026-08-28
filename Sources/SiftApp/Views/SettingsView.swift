@@ -215,23 +215,15 @@ struct SettingsView: View {
         }
     }
 
-    /// Point the app at a different library folder. Creates the standard
-    /// layout first — pointing at an empty folder used to leave the user
-    /// staring at an empty library with the reason buried in a property
-    /// nothing displayed.
     private func applyRoot() {
         let url = URL(fileURLWithPath: (rootPath as NSString).expandingTildeInPath)
-        let cfg = AppConfig(iCloudRoot: url)
         do {
-            try cfg.ensureLayout()
+            try store.setLibraryRoot(url)
         } catch {
             rootStatus = ("Couldn't use that folder: \(error.localizedDescription)", true)
             return
         }
-        store.config = cfg
-        cfg.save()
         rootStatus = ("Library folder set. \(AppConfig.cloudProviderName(for: url) ?? "Not in a synced cloud folder") — \(url.path)", false)
-        Task { await store.rescan() }
     }
 
     private func addWatchedFolder() {

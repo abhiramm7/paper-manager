@@ -147,10 +147,10 @@ struct ConsolidateAuthorsSheet: View {
         phase = .loading
         errorMessage = nil
         progressLabel = "Cleaning up author entries…"
+        // Task inherits the view's main actor, so state writes are direct.
         Task {
             // Step 1: strip "et al." junk from disk. Idempotent, fast.
-            let cleaned = await MainActor.run { store.cleanupAuthorJunk() }
-            await MainActor.run { self.junkCleaned = cleaned }
+            junkCleaned = store.cleanupAuthorJunk()
 
             // Step 2: multi-pass LLM consolidation. Each pass sees the
             // simulated result of the previous so subtle duplicates surface.
@@ -158,17 +158,11 @@ struct ConsolidateAuthorsSheet: View {
                 let merges = try await store.proposeAuthorMergesThorough(maxPasses: maxPasses) { pass, total in
                     self.progressLabel = "LLM pass \(pass) of \(total)…"
                 }
-                let wrapped = merges.map { Proposal(id: UUID(), merge: $0, approved: true) }
-                await MainActor.run {
-                    self.proposals = wrapped
-                    self.phase = .ready
-                }
+                proposals = merges.map { Proposal(id: UUID(), merge: $0, approved: true) }
             } catch {
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.phase = .ready
-                }
+                errorMessage = error.localizedDescription
             }
+            phase = .ready
         }
     }
 
@@ -176,10 +170,8 @@ struct ConsolidateAuthorsSheet: View {
         let approved = proposals.filter { $0.approved }.map { $0.merge }
         guard !approved.isEmpty else { return }
         phase = .applying
-        Task {
-            store.applyAuthorMerges(approved)
-            await MainActor.run { self.phase = .done }
-        }
+        store.applyAuthorMerges(approved)
+        phase = .done
     }
 }
 

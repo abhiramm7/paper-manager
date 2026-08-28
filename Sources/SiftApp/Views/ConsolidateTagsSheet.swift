@@ -140,20 +140,15 @@ struct ConsolidateTagsSheet: View {
     private func kickoff() {
         phase = .loading
         errorMessage = nil
+        // Task inherits the view's main actor, so state writes are direct.
         Task {
             do {
                 let merges = try await store.proposeTagMerges()
-                let wrapped = merges.map { Proposal(id: UUID(), merge: $0, approved: true) }
-                await MainActor.run {
-                    self.proposals = wrapped
-                    self.phase = .ready
-                }
+                proposals = merges.map { Proposal(id: UUID(), merge: $0, approved: true) }
             } catch {
-                await MainActor.run {
-                    self.errorMessage = error.localizedDescription
-                    self.phase = .ready
-                }
+                errorMessage = error.localizedDescription
             }
+            phase = .ready
         }
     }
 
@@ -161,19 +156,15 @@ struct ConsolidateTagsSheet: View {
         let approved = proposals.filter { $0.approved }.map { $0.merge }
         guard !approved.isEmpty else { return }
         phase = .applying
-        Task {
-            store.applyTagMerges(approved)
-            if alsoRetag {
-                // Run re-tag on every paper. tagAllUntagged would skip already-
-                // tagged ones; force a refresh by calling generateTagsInBackground
-                // with force=true on each.
-                let ids = store.papers.map(\.id)
-                for id in ids {
-                    store.generateTagsInBackground(for: id, force: true, mode: .fast)
-                }
+        store.applyTagMerges(approved)
+        if alsoRetag {
+            // Re-tag every paper. tagAllUntagged would skip already-tagged
+            // ones; force a refresh instead.
+            for id in store.papers.map(\.id) {
+                store.generateTagsInBackground(for: id, force: true, mode: .fast)
             }
-            await MainActor.run { self.phase = .done }
         }
+        phase = .done
     }
 }
 
